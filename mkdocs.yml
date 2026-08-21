@@ -32,6 +32,7 @@ plugins:
 
 markdown_extensions:
   - admonition
+  - md_in_html
   - pymdownx.arithmatex:
       generic: true
   - pymdownx.details

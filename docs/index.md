@@ -1,3 +1,31 @@
+<div align="center" markdown>
+
+# 🚧 ⚠️ STATUS WARNING ⚠️ 🚧
+
+### **This repo is a first vibe-coded draft and has seen no manual validation yet.**
+
+</div>
+
+!!! danger "🤖 Written end-to-end by an AI agent"
+
+    Nothing here has been checked by a human against an independent reference.
+
+    🧪 The test suite is green and several results are pinned to closed-form values —
+    but **a passing test only proves the code agrees with itself**, not with physics.
+
+    🔬 Treat every number on this site as unverified. Cross-check against ImpactX, Bmad
+    or Impact-Z directly before using this for anything that matters.
+
+!!! warning "🩹 Known-shaky areas, in rough order"
+
+    - The **resistive-wall wake model** ([`lume_impactx.wakes`](collective.md#wakefields))
+      — invented for a demonstration, not validated against a wake code.
+    - The **Bmad lattice bridge** ([`from_tao`](bmad.md)) — routed through MAD-X, and it
+      drops per-element numerics control.
+    - Anything touching **MPI** — untested, because no MPI-enabled build was available.
+
+---
+
 # LUME-ImpactX
 
 Tools for using [ImpactX](https://impactx.readthedocs.io) in
