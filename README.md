@@ -1,3 +1,28 @@
+<div align="center">
+
+# 🚧 ⚠️ STATUS WARNING ⚠️ 🚧
+
+### **This repo is a first vibe-coded draft and has seen no manual validation yet.**
+
+</div>
+
+> [!CAUTION]
+> 🤖 **Written end-to-end by an AI agent.** Nothing here has been checked by a human
+> against an independent reference.
+>
+> 🧪 The test suite is green and several results are pinned to closed-form values —
+> but **a passing test only proves the code agrees with itself**, not with physics.
+>
+> 🔬 Treat every number as unverified. Cross-check against ImpactX, Bmad or Impact-Z
+> directly before using this for anything that matters.
+>
+> 🩹 Known-shaky areas, in rough order: the **resistive-wall wake model**
+> (`lume_impactx/wakes.py` — invented for a demo, not validated), the **Bmad lattice
+> bridge** (routed through MAD-X, drops per-element numerics control), and anything
+> touching **MPI** (untested — no MPI build was available).
+
+---
+
 # lume-impactx
 
 ImpactX-specific implementation of LUMEModel classes for virtual accelerators.
