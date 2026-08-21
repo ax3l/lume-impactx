@@ -39,6 +39,7 @@ from lume_impactx.actions import (
     SimBoolAction,
     SimEnumAction,
     SimIntAction,
+    SimNDAction,
     SimScalarAction,
 )
 from lume_impactx.elements import element_attribute_schema, element_type
@@ -111,8 +112,15 @@ SIM_BOOLS = (
     "eigenemittances",
     "slice_step_diagnostics",
     "diagnostics",
+    "dynamic_size",
 )
 SIM_INTS = ("particle_shape", "csr_bins", "isr_order", "periods", "max_level")
+#: Array-valued settings: the space-charge mesh. Integer for cell counts, float for the
+#: relative box sizes.
+SIM_ARRAYS: dict[str, type] = {
+    "n_cell": np.int64,
+    "prob_relative": np.float64,
+}
 SIM_FLOATS = (
     "mlmg_relative_tolerance",
     "mlmg_absolute_tolerance",
@@ -513,7 +521,13 @@ def _make_ref_actions(simulator: ImpactXSimulator, config: RefConfig) -> list[Ac
 
 
 def _make_sim_actions(simulator: ImpactXSimulator, config: SimConfig) -> list[Action]:
-    known = list(SIM_ENUMS) + list(SIM_BOOLS) + list(SIM_INTS) + list(SIM_FLOATS)
+    known = (
+        list(SIM_ENUMS)
+        + list(SIM_BOOLS)
+        + list(SIM_INTS)
+        + list(SIM_FLOATS)
+        + list(SIM_ARRAYS)
+    )
     keys = known if config.include is None else config.include
 
     # Only expose settings that actually have a value. ImpactX has no readable default
@@ -560,6 +574,18 @@ def _make_sim_actions(simulator: ImpactXSimulator, config: SimConfig) -> list[Ac
                     name=var_name,
                     key=key,
                     default_value=int(current) if current is not None else None,
+                    read_only=read_only,
+                )
+            )
+        elif key in SIM_ARRAYS:
+            array = np.asarray(current, dtype=SIM_ARRAYS[key])
+            actions.append(
+                SimNDAction(
+                    name=var_name,
+                    key=key,
+                    shape=array.shape,
+                    dtype=np.dtype(SIM_ARRAYS[key]),
+                    default_value=array,
                     read_only=read_only,
                 )
             )

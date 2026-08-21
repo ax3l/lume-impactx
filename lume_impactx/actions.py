@@ -53,6 +53,7 @@ __all__ = [
     "SimIntAction",
     "SimBoolAction",
     "SimEnumAction",
+    "SimNDAction",
     "MomentAction",
     "MomentHistoryAction",
     "RunInfoAction",
@@ -249,6 +250,30 @@ class SimEnumAction(
     _SimAccessMixin, WritableActionMixin[ImpactXSimulator], EnumVariable
 ):
     """A simulation setting with a fixed option set, e.g. ``space_charge``."""
+
+
+class SimNDAction(_SimAccessMixin, WritableActionMixin[ImpactXSimulator], NDVariable):
+    """An array-valued simulation setting, e.g. ``n_cell`` or ``prob_relative``.
+
+    Writable because the simulator rebuilds the session on every track. ImpactX makes
+    ``n_cell`` read-only once ``init_grids()`` has run, so a model holding one live
+    session could not offer this at all.
+    """
+
+    def _get(self, simulator: Any) -> Any:
+        return np.asarray(_check(simulator).settings[self.key], dtype=self.dtype)
+
+    def _set(self, simulator: Any, value: Any) -> None:
+        array = np.asarray(value, dtype=self.dtype)
+        if array.shape != self.shape:
+            raise ValueError(
+                f"{self.name!r} expects shape {self.shape}, got {array.shape}."
+            )
+        # ImpactX wants a plain Python list of ints for the mesh settings.
+        as_list = array.tolist()
+        if np.issubdtype(self.dtype, np.integer):
+            as_list = [int(v) for v in as_list]
+        _check(simulator).settings[self.key] = as_list
 
 
 class MomentAction(ReadOnlyActionMixin[ImpactXSimulator], ScalarVariable):

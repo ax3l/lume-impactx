@@ -18,6 +18,7 @@ through the LUME model interface, so an ImpactX lattice can be driven by the sam
 | `particlegroup_to_impactx` / `read_beam_monitor` | Conversion between openPMD-beamphysics `ParticleGroup` and ImpactX beam data, in memory or from a `BeamMonitor` file. |
 | `archive` / `load_archive` | HDF5 persistence of a whole simulation. |
 | `plot_moments_with_layout` | Beam moments against `s`, with a lattice layout strip. |
+| `lume_impactx.wakes` | Resistive-wall wakefield as a drop-in lattice element. |
 | `ImpactXSimulator.from_tao` | Build a simulation from a Bmad/Tao model — beam exactly, lattice via MAD-X. |
 
 ## Installation
