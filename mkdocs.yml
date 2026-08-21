@@ -1,0 +1,52 @@
+site_name: LUME-ImpactX
+site_description: ImpactX-specific implementation of LUMEModel classes for virtual accelerators
+repo_url: https://github.com/lume-science/lume-impactx
+repo_name: lume-science/lume-impactx
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle: {icon: material/brightness-7, name: Switch to dark mode}
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle: {icon: material/brightness-4, name: Switch to light mode}
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: numpy
+            merge_init_into_class: true
+            show_root_heading: true
+            show_source: false
+            separate_signature: true
+            members_order: source
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - toc: {permalink: true}
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Variables: variables.md
+  - Staging: staging.md
+  - From Bmad/Tao: bmad.md
+  - Design notes: design.md
+  - API:
+      - Simulator: api/simulator.md
+      - Model: api/model.md
+      - Variable generation: api/config.md
+      - Particle conversion: api/utils.md
+      - Archiving: api/archive.md
+      - Plotting: api/plot.md
