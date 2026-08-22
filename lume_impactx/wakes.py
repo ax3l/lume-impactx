@@ -34,6 +34,8 @@ it against a dedicated wake code before using it for a real machine.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 __all__ = [
@@ -281,7 +283,9 @@ def ResistiveWallWake(
         Element name.
     length : float
         Length of pipe the wake represents, metres. The element itself has zero length;
-        place it directly after the drift it stands for.
+        place it directly after the drift it stands for. The kick is split across the
+        element's ``nslice`` slices, so the total is this length's worth however the
+        element is sliced.
     pipe_radius : float
         Beam-pipe radius, metres.
     conductivity : float
@@ -302,12 +306,29 @@ def ResistiveWallWake(
     from impactx import elements
 
     element = elements.Programmable(name=name, ds=0.0, nslice=1)
+    warned: set[str] = set()
 
     def push(particle_container, step, period):
+        # ImpactX calls this hook once per *slice*, not once per element -- measured,
+        # nslice=4 gives four calls. The kick is exactly linear in `length`
+        # (voltage = length * convolve(...)), so handing each slice its share keeps the
+        # total right whatever nslice is set to, instead of silently multiplying the
+        # wake by nslice.
+        slices = max(int(getattr(element, "nslice", 1) or 1), 1)
+        if getattr(element, "ds", 0.0) and "ds" not in warned:
+            warned.add("ds")
+            warnings.warn(
+                f"{name}: a wake element is a thin kick, but ds={element.ds} is set. "
+                "Programmable replaces an element's push entirely, so the particles "
+                "will not be advanced over that length -- put the drift in the lattice "
+                "separately.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         apply_longitudinal_wake(
             particle_container,
             lambda s: resistive_wall_wake(s, pipe_radius, conductivity),
-            length=length,
+            length=length / slices,
             num_bins=num_bins,
         )
 

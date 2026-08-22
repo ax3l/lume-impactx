@@ -41,11 +41,22 @@ captured, which is what Impact-Z's `write_beam_eles=("monitor::*", "marker::*")`
 so a mid-lattice monitor called `SCREEN1` shows up as `sim.particles["screen1"]`. The
 LUME spellings `initial` and `final` always work too.
 
-Capture is in memory — a zero-length
-[`beam_capture`](api/bmad.md) probe rather than ImpactX's file-writing `BeamMonitor` —
-so a get/set loop leaves no trail of files. It costs one `ParticleGroup` copy per marker,
-so pass `capture=False` to switch it off; the ends still resolve, from the run's own
-initial and final bunches.
+Capture is in memory and does **not** modify the lattice. It uses ImpactX's
+`sim.hook["after_element"]`, reading `sim.beam.to_df()` at the element's exit — the
+mechanism ImpactX's documentation prescribes for in-situ analysis:
+
+> The `Programmable` element is for *replacing* a beamline element's particle push. For
+> in-situ **analysis** of the beam, use `sim.hook` callbacks with `sim.beam` instead.
+
+A `Programmable` probe would also be wrong mechanically: its `push` hook fires once per
+**slice**, not once per element (measured — `nslice=4` gives four calls), so it behaves
+as a probe only by accident of being built with `nslice=1`. ImpactX's own `BeamMonitor`
+is the other alternative, but it writes openPMD to disk, which would leave a trail of
+files behind a get/set loop.
+
+Each capture copies one `ParticleGroup`, so pass `capture=False` to switch it off; the
+ends still resolve, from the run's own initial and final bunches. `capture_at` on the
+simulator takes the same list of element names directly.
 
 ## Driving it as a LUME model
 

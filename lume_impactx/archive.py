@@ -122,6 +122,7 @@ def archive(simulator: Any, dest: Any) -> None:
         )
         inputs.attrs["ref"] = json.dumps(simulator.ref, default=_json_default)
         inputs.attrs["settings"] = json.dumps(simulator.settings, default=_json_default)
+        inputs.attrs["capture_at"] = json.dumps(list(simulator.capture_at))
         if simulator.initial_particles is not None:
             simulator.initial_particles.write(inputs, name="initial_particles")
         if simulator.ref_origin is not None:
@@ -197,6 +198,8 @@ def load_archive(source: Any, track: bool = False) -> Any:
         lattice = dicts_to_lattice(json.loads(inputs.attrs["lattice"]))
         ref = json.loads(inputs.attrs["ref"])
         settings = json.loads(inputs.attrs["settings"])
+        # Archives written before capture_at existed simply have no captures.
+        capture_at = json.loads(inputs.attrs.get("capture_at", "[]"))
 
         initial_particles = None
         if "initial_particles" in inputs:
@@ -247,6 +250,7 @@ def load_archive(source: Any, track: bool = False) -> Any:
     simulator.npart = None
     simulator.bunch_charge_C = None
     simulator.initial_particles = initial_particles
+    simulator.capture_at = capture_at
     simulator.ref_origin = ref_origin
     simulator._results = results
     simulator.track_count = 0

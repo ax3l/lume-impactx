@@ -158,6 +158,11 @@ class ImpactXSimulator:
     settings : dict, optional
         Attributes to set on the ``ImpactX`` object, e.g. ``{"space_charge": "3D",
         "n_cell": [32, 32, 32], "particle_shape": 2}``.
+    capture_at : list of str, optional
+        Element names whose bunch should be kept, appearing in :attr:`particles` under
+        that name. Uses ImpactX's ``sim.hook["after_element"]`` -- the mechanism its
+        documentation prescribes for in-situ analysis -- so the lattice itself is not
+        modified. :meth:`from_tao` fills this in from the Bmad markers and monitors.
     track_on_init : bool
         Track once during construction so results are available immediately. Keep this
         True: a ``LUMEModel`` must be able to answer ``get()`` before any ``set()``.
@@ -179,6 +184,7 @@ class ImpactXSimulator:
         initial_particles: ParticleGroup | None = None,
         ref_origin: ImpactXRefPart | None = None,
         settings: dict[str, Any] | None = None,
+        capture_at: list[str] | None = None,
         track_on_init: bool = True,
     ) -> None:
         if (distribution is None) == (initial_particles is None):
@@ -197,6 +203,7 @@ class ImpactXSimulator:
         self.npart = npart
         self.bunch_charge_C = bunch_charge_C
         self.initial_particles = initial_particles
+        self.capture_at = list(capture_at or [])
         self.ref_origin = ref_origin
         self.settings = {**_DEFAULT_SETTINGS, **(settings or {})}
 
@@ -408,6 +415,7 @@ class ImpactXSimulator:
         import time
 
         sim = self._build()
+        captured = self._install_capture_hook(sim)
         optics = self._linear_optics(sim)
         start = time.monotonic()
         try:
@@ -423,7 +431,7 @@ class ImpactXSimulator:
                 "n_particles": int(beam.total_number_of_particles()),
                 "n_steps": self.n_steps,
                 "run_time": time.monotonic() - start,
-                "captured_particles": self._harvest_captures(),
+                "captured_particles": captured,
                 **optics,
             }
         finally:
@@ -431,6 +439,49 @@ class ImpactXSimulator:
 
         self.track_count += 1
         return self._results
+
+    def _install_capture_hook(self, sim) -> dict[str, Any]:
+        """Snapshot the bunch after each element named in ``capture_at``.
+
+        Uses ImpactX's ``sim.hook["after_element"]``, which is what its documentation
+        prescribes for in-situ analysis: *"The Programmable element is for replacing a
+        beamline element's particle push. For in-situ analysis of the beam, use sim.hook
+        callbacks with sim.beam instead."* A ``Programmable`` probe would also be wrong
+        mechanically -- its ``push`` fires once per **slice**, not once per element
+        (measured: ``nslice=4`` gives four calls) -- so it only behaves as a probe by
+        accident of being built with ``nslice=1``.
+
+        The hook fires exactly once per element and carries ``sim.tracking_element``, so
+        the bunch is taken at the element's exit, with the reference particle already
+        where that element left it.
+
+        Returns
+        -------
+        dict
+            Filled in as tracking proceeds; read it after ``track_particles()``.
+        """
+        captured: dict[str, Any] = {}
+        # getattr, not attribute access: archive.load_archive rebuilds an instance with
+        # __new__ and assigns fields, so an older archive may not carry this one.
+        capture_at = getattr(self, "capture_at", None)
+        if not capture_at:
+            return captured
+        wanted = {str(name) for name in capture_at}
+
+        def after_element(instance) -> None:
+            element = getattr(instance, "tracking_element", None)
+            name = str(getattr(element, "name", "") or "")
+            if name in wanted:
+                # _snapshot_particles reads instance.beam.to_df(local=True) and takes
+                # the reference from beam.ref, which at an after_element hook is where
+                # that element left it -- so a probe downstream of a bend or an
+                # accelerating cavity is converted against the right frame.
+                captured[name] = self._snapshot_particles(instance.beam)
+
+        sim.hook["after_element"] = after_element
+        # pybind stores the callback without owning it; a collected callback is a crash.
+        self._capture_hook = after_element
+        return captured
 
     def run(self) -> dict[str, Any]:
         """Run the simulation. An alias for :meth:`track`.
@@ -441,20 +492,6 @@ class ImpactXSimulator:
         ``track_particles``.
         """
         return self.track()
-
-    def _harvest_captures(self) -> dict[str, Any]:
-        """Collect what any :func:`~lume_impactx.elements.beam_capture` probes saw.
-
-        Must run before ``finalize()``: the captures hold ParticleGroups, which are
-        plain numpy, but the elements themselves belong to the torn-down simulation.
-        """
-        captured: dict[str, Any] = {}
-        for element in self.lattice:
-            capture = getattr(element, "_lume_impactx_capture", None)
-            if capture is not None and capture.get("particles") is not None:
-                captured[str(capture["name"])] = capture["particles"]
-                capture["particles"] = None
-        return captured
 
     @property
     def particles(self) -> dict[str, ParticleGroup]:

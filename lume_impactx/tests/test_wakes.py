@@ -8,7 +8,11 @@ charge and length -- rather than on regression numbers.
 from __future__ import annotations
 
 import numpy as np
+import inspect
+
 import pytest
+
+from lume_impactx import wakes
 
 from lume_impactx.wakes import (
     C_LIGHT,
@@ -207,3 +211,82 @@ def test_csr_validity_margin_rejects_nonsense():
     for args in [(0.0, 1e-4, 1e-4), (5.0, 0.0, 1e-4), (5.0, 1e-4, -1.0)]:
         with pytest.raises(ValueError, match="must be positive"):
             csr_validity_margin(*args)
+
+
+def test_the_kick_does_not_depend_on_nslice():
+    """ImpactX fires a Programmable's push once per *slice*, not once per element.
+
+    Measured directly: a probe with nslice=4 sees four calls. A wake that ignored that
+    would apply its kick four times over. The kick is linear in `length`, so each slice
+    takes its share and the total is the same however the element is sliced.
+    """
+    energies = {}
+    for nslice in (1, 4):
+        simulator = _wake_simulator(nslice=nslice)
+        energies[nslice] = simulator.final_particles["mean_energy"]
+
+    baseline = _wake_simulator(nslice=1, wake=False).final_particles["mean_energy"]
+    kick = {n: energies[n] - baseline for n in energies}
+    # The wake must actually do something, or this test proves nothing.
+    assert abs(kick[1]) > 0.0
+    assert kick[4] == pytest.approx(kick[1], rel=1e-9), kick
+
+
+def _wake_simulator(nslice: int, wake: bool = True):
+    """A short drift with, or without, a resistive-wall wake after it."""
+    from impactx import elements
+
+    from lume_impactx import ImpactXSimulator
+    from lume_impactx.wakes import ResistiveWallWake
+
+    lattice = [elements.Drift(name="pipe", ds=1.0, nslice=4)]
+    if wake:
+        element = ResistiveWallWake("rw", length=1.0, pipe_radius=0.01)
+        element.nslice = nslice
+        lattice.append(element)
+    return ImpactXSimulator(
+        lattice=lattice,
+        ref={"species": "electron", "kin_energy_MeV": 100.0},
+        distribution=_wake_distribution(),
+        npart=2000,
+        bunch_charge_C=1e-9,
+    )
+
+
+def _wake_distribution():
+    from impactx import distribution
+
+    return distribution.Waterbag(
+        lambdaX=1e-4,
+        lambdaY=1e-4,
+        lambdaT=1e-4,
+        lambdaPx=1e-5,
+        lambdaPy=1e-5,
+        lambdaPt=1e-5,
+    )
+
+
+def test_the_wake_uses_the_whole_bunch_not_one_tile():
+    """A wake needs the whole line charge density, so the hook choice matters.
+
+    ImpactX offers two Programmable hooks, and they deliver very different things.
+    Measured on a 200k-particle bunch:
+
+      push            1 call,  200000 particles  (the whole container)
+      beam_particles  14 calls,  14286 particles each (one per tile)
+
+    `beam_particles` is the high-performance per-tile hook. Using it here would compute
+    the line density from a fragment of the bunch and silently scale the wake wrong, so
+    this guards the choice of `push` against a well-meaning optimisation.
+    """
+    from lume_impactx.wakes import ResistiveWallWake
+
+    factory = inspect.getsource(ResistiveWallWake)
+    assert "element.push = push" in factory
+    # The per-tile hook must be left alone.
+    assert "beam_particles" not in factory
+
+    # And the gather really is over every tile, at every level.
+    source = inspect.getsource(wakes.apply_longitudinal_wake)
+    assert "finest_level" in source
+    assert "ImpactXParIter" in source
