@@ -18,8 +18,9 @@
 >
 > 🩹 Known-shaky areas, in rough order: the **resistive-wall wake model**
 > (`lume_impactx/wakes.py` — invented for a demo, not validated), the **Bmad lattice
-> bridge** (routed through MAD-X, drops per-element numerics control), and anything
-> touching **MPI** (untested — no MPI build was available).
+> translation** (each element mapping is verified against Bmad tracking, but the soft
+> bend edge, a bend roll and Bmad's own coarse multipole integrator differ in known
+> ways), and anything touching **MPI** (untested — no MPI build was available).
 
 ---
 

@@ -20,8 +20,9 @@
 
     - The **resistive-wall wake model** ([`lume_impactx.wakes`](collective.md#wakefields))
       — invented for a demonstration, not validated against a wake code.
-    - The **Bmad lattice bridge** ([`from_tao`](bmad.md)) — routed through MAD-X, and it
-      drops per-element numerics control.
+    - The **Bmad lattice translation** ([`from_tao`](bmad.md)) — each element mapping is
+      verified against Bmad tracking, but the soft bend edge, a bend roll and Bmad's own
+      coarse multipole integrator differ in known ways.
     - Anything touching **MPI** — untested, because no MPI-enabled build was available.
 
 ---
@@ -47,7 +48,8 @@ through the LUME model interface, so an ImpactX lattice can be driven by the sam
 | `archive` / `load_archive` | HDF5 persistence of a whole simulation. |
 | `plot_moments_with_layout` | Beam moments against `s`, with a lattice layout strip. |
 | `lume_impactx.wakes` | Resistive-wall wakefield as a drop-in lattice element. |
-| `ImpactXSimulator.from_tao` | Build a simulation from a Bmad/Tao model — beam exactly, lattice via MAD-X. |
+| `ImpactXSimulator.from_tao` | Build a simulation from a Bmad/Tao model — beam and lattice, element by element. |
+| `LUMEImpactXModel.from_tao` | The same, straight to a LUME model with generated variables. |
 
 ## Installation
 

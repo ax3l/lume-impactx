@@ -79,6 +79,44 @@ class LUMEImpactXModel(
 
         return cls(simulator, make_actions(simulator, config), **kwargs)
 
+    @classmethod
+    def from_tao(
+        cls,
+        tao: Any,
+        config: Any = None,
+        dummy_run: bool = False,
+        **kwargs: Any,
+    ) -> "LUMEImpactXModel":
+        """Build a model straight from a Bmad/Tao model.
+
+        Equivalent to ``from_simulator(ImpactXSimulator.from_tao(tao, ...))``, and the
+        one-step path from a Tao session to a LUME model with generated variables.
+        Every element mapping is verified against Bmad tracking; read
+        :func:`lume_impactx.interfaces.bmad.translate_element` for what differs and
+        what is dropped.
+
+        Parameters
+        ----------
+        tao : pytao.Tao
+            A Tao instance with a tracked beam saved at the start element.
+        config : VariableMappingConfig, optional
+            Controls which variables are generated and how they are named.
+        dummy_run : bool
+            Skip re-tracking on ``set()``, to batch several writes into one run.
+        **kwargs
+            Passed to :func:`~lume_impactx.interfaces.bmad.simulator_from_tao`, e.g.
+            ``ele``, ``lattice``, ``nslice``, ``settings``, ``skip_unsupported``.
+
+        Examples
+        --------
+        >>> model = LUMEImpactXModel.from_tao(tao, nslice=16)
+        >>> model.set({"ele:qf:k": 1.3})
+        >>> model.get("moment_final:sigma_x")
+        """
+        from lume_impactx.interfaces.bmad import model_from_tao
+
+        return model_from_tao(tao, config=config, dummy_run=dummy_run, **kwargs)
+
     def _set(self, values: dict[str, Any]) -> None:
         super()._set(values)
         if not self.dummy_run:

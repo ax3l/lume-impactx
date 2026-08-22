@@ -53,6 +53,7 @@ nav:
   - API:
       - Simulator: api/simulator.md
       - Model: api/model.md
+      - Bmad/Tao translation: api/bmad.md
       - Variable generation: api/config.md
       - Particle conversion: api/utils.md
       - Archiving: api/archive.md

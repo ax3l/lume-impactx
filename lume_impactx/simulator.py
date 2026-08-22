@@ -180,9 +180,12 @@ class ImpactXSimulator:
     def from_tao(cls, tao: Any, **kwargs: Any) -> "ImpactXSimulator":
         """Build a simulator from a Bmad/Tao model.
 
-        The beam -- reference particle and bunch -- is taken faithfully from Tao. The
-        lattice is bridged through MAD-X unless you pass ``lattice=``; read
-        :func:`lume_impactx.interfaces.bmad.lattice_from_tao` for what that drops.
+        Both halves come straight from Tao: the reference particle and bunch, and the
+        lattice element by element, unless you pass ``lattice=``. Every element mapping
+        was verified against Bmad tracking; read
+        :func:`lume_impactx.interfaces.bmad.lattice_from_tao` and
+        :func:`~lume_impactx.interfaces.bmad.translate_element` for what still differs
+        and what is dropped.
 
         Parameters
         ----------
@@ -190,7 +193,7 @@ class ImpactXSimulator:
             A Tao instance with a tracked beam saved at the start element.
         **kwargs
             Passed to :func:`~lume_impactx.interfaces.bmad.simulator_from_tao`, e.g.
-            ``ele``, ``lattice``, ``nslice``, ``min_model``, ``settings``.
+            ``ele``, ``lattice``, ``nslice``, ``skip_unsupported``, ``settings``.
 
         Examples
         --------

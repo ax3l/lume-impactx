@@ -22,87 +22,224 @@ Bmad and pytao are **not dependencies** — install them from conda-forge:
 conda install -c conda-forge bmad pytao
 ```
 
-## The beam is translated faithfully; the lattice is bridged
+## Driving it as a LUME model
 
-These two halves have very different standing, and it matters.
+`ImpactXSimulator.from_tao` gives you a simulation. `LUMEImpactXModel.from_tao` goes one
+step further and hands back a LUME model: it translates, tracks once, and generates the
+action variables, so the result can be driven by `get()`/`set()` or served over EPICS by
+`lume-pva` without any further wiring.
+
+```python
+from lume_impactx import LUMEImpactXModel
+
+model = LUMEImpactXModel.from_tao(tao, nslice=16)
+
+model.get("moment_final:sigma_x")      # 1.578686e-03
+model.set({"ele:QF:k": 1.5})           # writes, then re-tracks
+model.get("moment_final:sigma_x")      # 1.356999e-03
+model.reset()                          # back to the translated lattice
+```
+
+It is exactly `LUMEImpactXModel.from_simulator(ImpactXSimulator.from_tao(tao, ...))`, and
+takes the same translator keywords — `ele`, `lattice`, `nslice`, `species`, `settings`,
+`skip_unsupported` — plus `config` and `dummy_run`.
+
+Variable names use Bmad's element names as they come out of Tao, which are **upper case**
+— `ele:QF:k`, not `ele:qf:k`. Repeated names are disambiguated by index: a FODO cell whose
+two drifts are both called `D` generates `ele:D#1:ds` and `ele:D#2:ds`.
+
+!!! tip "Batch writes when tracking is expensive"
+    Every `set()` re-runs the whole simulation, which with space charge on can take
+    minutes. Pass `dummy_run=True` to write several variables first and track once:
+
+    ```python
+    model = LUMEImpactXModel.from_tao(tao, dummy_run=True)
+    model.set({"ele:QF:k": 1.5, "ele:QD:k": -1.5})
+    model.simulator.track()
+    ```
+
+## Both halves are direct translations
 
 **Beam — exact.** The bunch comes from `tao.particles(ele)`, which pytao already returns
 as an openPMD-beamphysics `ParticleGroup`, and that is precisely what ImpactX's converter
-consumes. Nothing resamples or re-centres it. Against a Bmad FODO cell the energy
-distribution comes through at machine precision:
+takes. The reference particle uses the *design* energy `E_TOT` at that element, not the
+bunch mean, so a mis-centred bunch stays mis-centred instead of being silently re-centred.
 
-| quantity | agreement with Bmad |
-|---|---|
-| `mean_energy`, `sigma_energy` | 2e-15 |
-| charge, particle count | exact |
-| `sigma_x` | 4e-7 |
-| `norm_emit_x` | 3e-5 |
+**Lattice — element by element.** Every element is translated directly into ImpactX
+elements. No intermediate format is involved. ImpactX's *exact* models are used
+throughout (`ExactDrift`, `ExactQuad`, `ExactSbend`, `ExactMultipole`), because the
+paraxial ones disagree with Bmad at the 5e-5 level.
 
-The transverse residuals are **not** from the beam hand-off — they are the lattice.
+Every mapping below was established against Bmad itself — by comparing Tao's `ele_mat6`
+taken into ImpactX's basis, and by tracking the same 64-particle bunch through both codes
+at 100 MeV with a 5e-4 momentum spread. The agreement column is the worst relative
+coordinate difference measured, and `lume_impactx/tests/test_bmad.py` asserts it: the
+`test_tracking_matches_bmad` cases re-run the comparison against Bmad on every test run.
 
-**Lattice — a bridge.** There is no direct Bmad→ImpactX translator. `from_tao` routes
-Bmad → MAD-X → ImpactX using each code's own exporter and importer, so it carries only
-what all three represent. ImpactX itself warns that its MAD-X parser is "under active
-development and provided as a preview".
+| Bmad | ImpactX | agreement |
+| --- | --- | --- |
+| `drift`, `pipe`, `monitor`, `instrument`, collimators | `ExactDrift` | 2.8e-15 |
+| `marker`, zero-length drift-like | `Marker` | exact |
+| `quadrupole` | `ChrQuad(k=K1)` | 1.9e-14 |
+| quadrupole fringe | `QuadEdge(k=K1)` at each end | 1.9e-14 |
+| `sbend` / `rbend` body | `ExactSbend(phi=ANGLE)` | 1.4e-11 |
+| bend pole faces, incl. `FINT`/`HGAP` | `DipEdge(psi, rc, g=2·HGAP, K2=FINT, K3=0)` | 2.2e-9 |
+| `sbend` with `k1`/`k2`, Cartesian multipoles | `ChrQuad`+`ThinDipole`(+`Multipole`) steps | 4.7e-6 at 32 steps |
+| `sbend` with `k1`, `exact_multipoles=vertically_pure` | `ExactCFbend` | 2.5e-7 |
+| zero-angle `sbend` with `k1` | `ChrQuad(k=K1)` | 2.2e-14 |
+| `solenoid` | `ChrAcc(ez=0, bz=KS·βγ)` | 2.9e-9 |
+| `sextupole` | `ExactMultipole(k_normal=[0,0,K2])` | 9.2e-11 (see note) |
+| `octupole` | `ExactMultipole(k_normal=[0,0,0,K3])` | 1.2e-9 |
+| `hkicker`/`vkicker`/`kicker` | `Kicker(xkick, ykick)` | 1.3e-14 |
+| `rfcavity` | sliced `ExactDrift` + `ShortRF` | 8.5e-8 |
+| `lcavity`, travelling wave | sliced `ExactDrift` + `ShortRF` | 9.6e-6 |
+| `x_offset`/`y_offset` | `dx`/`dy` (same sign) | 6.2e-9 |
+| `tilt` | `rotation = +degrees(TILT)` | 2.2e-14 |
+| bend `ref_tilt` | `rotation` on body *and* edges | 1.2e-11 |
+| bend `roll` | half bends around a centre `Kicker` | 99.93%, see below |
+| `is_on = F` (straight elements) | `ExactDrift` of the same length | 6.0e-15 |
+| aperture limits | `Aperture`, shape from `aperture_type` | exact |
 
-!!! warning "What the bridge drops, silently"
+The sextupole figure is measured with Bmad's own integrator converged. At Bmad's default
+of a single step the two differ by 2.4e-6 — that is Bmad's integration error, not the
+translation's.
 
-    - **Numerics control.** `nslice` is applied uniformly; Bmad's per-element integrator
-      choice, `num_steps`, `ds_step` and tracking/mat6 methods have no MAD-X
-      representation. *TODO: map these per element once a direct translator exists.*
-    - Element types MAD-X cannot express: taylor maps, wigglers/undulators, `patch`
-      elements, `em_field`, and Bmad's `overlay` / `group` / `girder` control structures.
-    - Multipole error tables, aperture definitions, fringe-field models and higher-order
-      edge effects.
-    - Multi-branch lattices — only the tracked branch is written.
+!!! note "Exact is not always the right model"
+    ImpactX's `Exact*` elements are the more physical maps, but Bmad's `bmad_standard`
+    body for a quadrupole, a solenoid and a combined-function bend is **paraxial in
+    (x, y) and exact in energy** — `track_a_bend.f90:111` says so outright. That is
+    precisely what ImpactX's `Chr*` family models, which is why `ChrQuad` beats
+    `ExactQuad` by 250,000× here (1.9e-14 against 4.5e-9). Bmad's *drift* and *pure bend
+    body* really are exact, so `ExactDrift` and `ExactSbend` win there. The choice is
+    made per element, from what Bmad actually does.
 
-    Check the result against the Bmad model before trusting a number from it.
+!!! note "Sign conventions are ImpactX's, not Impact-Z's"
+    The tilt sign is `+degrees(TILT)` here, where lume-impact's Impact-Z translator needs
+    a *negated* tilt. Two codes from the same family are not interchangeable, and each
+    sign above was checked against its negated alternative, which is wrong by O(1).
 
-If you already have an ImpactX lattice you trust, pass it and use `from_tao` only for the
-beam:
+## What differs, and by how much
+
+These are model differences, not mapping errors, and each emits a
+`TaoTranslationWarning` naming the element — except the multipole integrator, where the
+coarse side is Bmad rather than the translation.
+
+**Some bend fringe types use a different map.** `basic_bend` (Bmad's default) and
+`linear_edge` use the Hwang & Lee map that ImpactX's `DipEdge` implements, and agree to
+2.2e-9 and 1.5e-5 *including* `FINT`/`HGAP`, which map exactly onto `g = 2·HGAP`,
+`K2 = FINT`. But `full` uses a PTC Lie map in Bmad and `sad_full` uses SAD's, which no
+`DipEdge` parameter reproduces: residuals of 6.1e-5, 3.3e-4 and 7.9e-5 for `full`,
+`sad_full` and `soft_edge_only`.
+
+**Bmad integrates multipoles coarsely by default.** A `sextupole` or `octupole` is
+tracked with `num_steps` drift-kick-drift steps, and Bmad defaults to *one*. ImpactX's
+`nslice` steps are finer, so the two differ by Bmad's integration error, which grows with
+strength: a `k2 = 25` sextupole differs by 2.4e-6 at Bmad's default, falling to 9.2e-11
+once `num_steps` is raised to 200, while a `k3 = 80` octupole is already converged at
+1.2e-9. ImpactX is the more accurate side here, so this is documented rather than warned
+about — raise `num_steps` in Bmad to close it.
+
+**A combined-function bend depends on Bmad's `exact_multipoles`.** ImpactX's
+`ExactCFbend` expands multipoles in curvilinear coordinates, so it matches Bmad's
+`vertically_pure` setting (2.5e-7) but not its default `off`, which is Cartesian. That
+gap is a *convention*, not convergence: it is unmoved by Bmad `num_steps=400` and
+`integrator_order=6`, and by ImpactX `int_order` 2→6 and `mapsteps` 10→400. For Bmad's
+default the bend is instead split into `ChrQuad`/`ThinDipole` steps in Bmad's own model,
+converging as 7.5e-5 at 8 steps, 4.7e-6 at 32 and 2.9e-7 at 128. (ImpactX's own defaults
+of `int_order=2, mapsteps=10` are under-converged for `ExactCFbend` — worth 10× — so
+`int_order=4, mapsteps=100` is used.)
+
+**A bend `roll` has no ImpactX equivalent and is carried as its effect.** This was
+checked rather than assumed: `Alignment(rotation=...)`, `PlaneXYRot` and `PRot` all turn
+the reference orbit with the magnet, which is `REF_TILT`, not `ROLL`. `PlaneXYRot`
+measures identical to `rotation` (0.9497 versus 0.9492 against a rolled bend), and `PRot`
+rotates in the *x-z* plane, which is pole-face geometry. So the roll is applied as what
+it physically does: an on-axis particle leaves a bend rolled by `psi` with
+`px = ANGLE·(1 − cos psi)` and `py = −ANGLE·sin psi`, placed as a thin kick between two
+half bends. That captures **99.93%** of the dominant out-of-plane kick at every roll from
+1e-4 to 0.1 rad. The much smaller in-plane component is captured less well — 23% at
+roll 1e-4, 75% at 1e-3, 97% at 1e-2 — but it is 3700× smaller in absolute terms at the
+small-roll end. Dropping the roll, as a translator without this would, captures none of
+either.
+
+**A standing-wave `lcavity` is indicative only.** The reference-energy change itself is
+carried to 3e-12 — `ShortRF` updates ImpactX's reference particle directly — and a
+travelling-wave cavity tracks to 9.6e-6. But Bmad's Rosenzweig–Serafini edge focusing and
+the standing-wave ponderomotive focusing are not modelled, and for the standing-wave
+default that costs **9.1e-2**. The warning says which case you are in.
+
+## What is dropped
+
+Each of these warns with the element name and attribute:
+
+- `ROLL`'s in-plane component, and a bend carrying **both** `REF_TILT` and a transverse
+  offset — Bmad displaces the magnet about the bend centre in the tilted frame, which
+  ImpactX's element alignment does not reproduce (1.8e-4). Either one alone is exact.
+- `x_pitch`/`y_pitch` and `z_offset` — ImpactX elements have transverse offsets and a
+  roll, but no pitch and no longitudinal offset.
+- `hkick`/`vkick` on an element that is not a kicker.
+- Multipole error tables (`A_n`/`B_n`) attached to a magnet — a skew-quad error `a2 = 5`
+  on a quadrupole moves a tracked bunch by 4.0e-3, invisible to a transfer-matrix check.
+- `DG`, a bend field error — the translated bend uses the design angle.
+- Fringe fields other than bend pole faces and quadrupole edges. Bmad's default is `None`
+  for quadrupoles, solenoids and sextupoles, and its `rfcavity`/`lcavity` tracking
+  ignores `FRINGE_TYPE` entirely, so this stays quiet in practice.
+- Bmad's soft quadrupole edge, but only when `FQ1`/`FQ2` are actually set — they default
+  to zero, which makes that map a no-op.
+- `PHI0_AUTOSCALE`. `PHI0_MULTIPASS` is **not** dropped: `track_a_rfcavity.f90:81` adds
+  it into the phase, so the translation does too.
+
+A switched-off **bend** raises rather than warning: `track_a_bend.f90:90-94` zeroes the
+field but keeps the curved geometry, so it is not a drift and ImpactX cannot express it.
+So does any element with length and no verified equivalent — `taylor`, `wiggler`,
+`patch`, `sol_quad`, `match`, `elseparator`. Pass `skip_unsupported=True` to replace them
+with markers and warn instead:
 
 ```python
-sim = ImpactXSimulator.from_tao(tao, lattice=my_impactx_elements)
+lattice = lattice_from_tao(tao, nslice=10, skip_unsupported=True)
 ```
 
-## Element models
+## Reference energy
 
-`min_model` picks the lowest ImpactX element-model tier the importer may use:
+Bmad holds `p0c` fixed across an `rfcavity` while ImpactX's reference particle really is
+accelerated. Every strength Bmad normalises to *its* momentum — quadrupole `k`, multipole
+coefficients, steering kicks — is therefore rescaled by `p0c_Bmad / p0c_ImpactX` at each
+element, and geometric quantities are not. Without it, a quadrupole after a 5 MV cavity
+at `phi0 = 0.25` is referenced to the wrong rigidity and tracks 4.9e-2 away from Bmad;
+with it, 8.5e-8. The rescale is announced with a warning naming the element and factor,
+and is exactly 1 in a lattice with no acceleration.
 
-| `min_model` | elements produced |
-|---|---|
-| `"linear"` | `Quad`, `Drift` |
-| `"paraxial"` | `ChrQuad`, `ChrDrift` |
-| `"exact"` (default here) | `ExactQuad`, `ExactDrift` |
+## Controlling the numerics
 
-`from_tao` defaults to `"exact"`, since a Bmad user is usually after fidelity rather than
-speed. The parameter landed after ImpactX 26.08 — on an older build the lattice loads
-with linear models and a `TaoTranslationWarning` says so, rather than failing.
-
-## A Tao export quirk worth knowing
-
-Tao writes a *labelled* MAD-X beam definition terminated by `;;`:
-
-```
-beam_def: Beam, Particle = Electron, Energy = 6.0E-003, Npart = 0.0E+000;;
-```
-
-ImpactX's parser reads that as an **empty** species and aborts the entire load with
-`Unknown MAD-X particle species requires explicit MASS and CHARGE in the BEAM command`.
-Deleting the line does not help either — the parser requires a BEAM command. So the
-bridge rewrites it into the bare lowercase form, using the species and energy already
-taken from Tao. Worth fixing on one side or the other upstream.
-
-## Using the pieces separately
+`nslice` sets the number of steps per thick element (default 8). Bmad's own `num_steps`
+and `ds_step` are deliberately *not* read across, because they drive a different
+integrator:
 
 ```python
-from lume_impactx.interfaces.bmad import beam_from_tao, lattice_from_tao
-
-reference, particles = beam_from_tao(tao, ele="BEGINNING")
-lattice = lattice_from_tao(tao, nslice=10, min_model="exact")
+sim = ImpactXSimulator.from_tao(tao, nslice=20)
 ```
 
-`reference_from_tao` uses Bmad's **design** reference energy `E_TOT`, not the bunch mean.
-That is the faithful choice: ImpactX phase-space coordinates are offsets from the
-reference particle, so the design reference reproduces Bmad's own `pz` offsets instead of
-re-centring the bunch.
+Raise it where the translation is a splitting rather than a single element — a
+combined-function bend, an `rfcavity` or an `lcavity` — since those converge with
+`nslice`.
+
+Bends default to `fringe_type = Basic_Bend`, which maps exactly, `FINT`/`HGAP` included.
+To compare the body alone, turn the fringe off in Bmad and the translator will emit no
+edges:
+
+```python
+tao.cmd("set ele * fringe_type = none")
+```
+
+## Branches
+
+`branch` selects which lattice branch to translate, and reaches the beam, the reference
+mass and the lattice together:
+
+```python
+sim = ImpactXSimulator.from_tao(tao, branch=1)
+```
+
+Elements are enumerated with Tao's `-track_only -index_order` flags. `-no_slaves`, the
+obvious-looking choice, keeps *lords* while bare indices address the tracking branch —
+mixing the two silently truncates a superposed lattice or translates a super-lord twice.
