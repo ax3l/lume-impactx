@@ -16,6 +16,7 @@ on the affected types, so it has to be applied conditionally.
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any
 
@@ -149,6 +150,20 @@ def archive(simulator: Any, dest: Any) -> None:
         if results["final_particles"] is not None:
             results["final_particles"].write(outputs, name="final_particles")
 
+        # The captured bunches, not just the promise of them: restoring capture_at
+        # without these made the loaded simulator claim a probe it could not produce.
+        captured = results.get("captured_particles") or {}
+        if captured:
+            capture_group = outputs.create_group("captured_particles")
+            names = []
+            for index, (name, bunch) in enumerate(captured.items()):
+                if not isinstance(bunch, ParticleGroup):
+                    continue  # an unrepresentable bunch, or an ungathered MPI rank
+                # By index, because an element name is not a safe HDF5 group name.
+                bunch.write(capture_group, name=str(index))
+                names.append(name)
+            capture_group.attrs["names"] = json.dumps(names)
+
         # Linear optics, when the lattice produced them. Stored as datasets so a
         # restored simulator generates the same optics:* variables as the original.
         optics = outputs.create_group("optics")
@@ -220,6 +235,15 @@ def load_archive(source: Any, track: bool = False) -> Any:
         if "final_particles" in outputs:
             final_particles = ParticleGroup(h5=outputs["final_particles"])
 
+        captured_particles: dict[str, Any] = {}
+        if "captured_particles" in outputs:
+            capture_group = outputs["captured_particles"]
+            names = json.loads(capture_group.attrs.get("names", "[]"))
+            for index, name in enumerate(names):
+                key = str(index)
+                if key in capture_group:
+                    captured_particles[name] = ParticleGroup(h5=capture_group[key])
+
         optics: dict[str, Any] = {}
         if "optics" in outputs:
             optics_group = outputs["optics"]
@@ -236,6 +260,7 @@ def load_archive(source: Any, track: bool = False) -> Any:
             "n_particles": int(outputs.attrs["n_particles"]),
             "n_steps": int(outputs.attrs["n_steps"]),
             "run_time": float(outputs.attrs["run_time"]),
+            "captured_particles": captured_particles,
             **optics,
         }
     finally:
@@ -259,7 +284,10 @@ def load_archive(source: Any, track: bool = False) -> Any:
 
     simulator._initial_lattice = snapshot_lattice(lattice)
     simulator._initial_ref = dict(ref)
-    simulator._initial_settings = dict(settings)
+    # deepcopy, matching __init__: a shallow dict shares its list values, so mutating
+    # settings["n_cell"] -- itself an exposed variable -- would also mutate the baseline
+    # that reset() restores from.
+    simulator._initial_settings = copy.deepcopy(settings)
     simulator._initial_particles_0 = initial_particles
     simulator._ref_origin_0 = ref_origin
 

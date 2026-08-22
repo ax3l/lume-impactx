@@ -107,6 +107,10 @@ lattice = [
 ]
 ```
 
+The wake model is **single-rank only**: it bins and convolves the particles on one
+rank, and nothing reduces across ranks, so it refuses to run under MPI rather than
+return a quietly wrong line charge density.
+
 It is a zero-length `Programmable` whose push hook bins the bunch by arrival time,
 convolves the line charge with the wake function, and applies the energy change. Place it
 directly after the drift whose length it stands for.

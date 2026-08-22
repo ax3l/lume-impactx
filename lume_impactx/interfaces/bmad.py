@@ -1253,22 +1253,29 @@ def lattice_from_tao(
 def capture_points_from_tao(tao: Any, branch: int = 0) -> list[str]:
     """Names of the Bmad elements whose bunch is worth keeping.
 
-    Markers, monitors and instruments, mirroring Impact-Z's
-    ``write_beam_eles=("monitor::*", "marker::*")``. These are names for
-    :attr:`~lume_impactx.simulator.ImpactXSimulator.capture_at`, not lattice elements:
-    ImpactX captures through ``sim.hook``, so nothing is inserted into the beamline.
+    Markers, monitors and instruments. Impact-Z's default is narrower --
+    ``write_beam_eles=("monitor::*", "marker::*")`` -- so this is a superset of it,
+    not a mirror.
+
+    These are names for :attr:`~lume_impactx.simulator.ImpactXSimulator.capture_at`,
+    not lattice elements: ImpactX captures through ``sim.hook``, so nothing is inserted
+    into the beamline.
+
+    Two ``lat_list`` calls rather than one ``ele_head`` per element -- the per-element
+    form duplicated the whole walk that :func:`lattice_from_tao` already does, adding
+    18% to the translation of a 302-element lattice.
+
+    Repeated names are returned once. The simulator disambiguates the occurrences when
+    it captures them, as ``NAME``, ``NAME##2`` and so on.
     """
-    names: list[str] = []
-    for index in _element_indices(tao, branch):
-        try:
-            head = dict(tao.ele_head(f"{branch}>>{index}"))
-        except Exception:  # pragma: no cover - already fatal in lattice_from_tao
-            continue
-        if str(head.get("key", "")).lower() in _CAPTURE_KEYS:
-            name = str(head.get("name", "") or "")
-            if name and name not in names:
-                names.append(name)
-    return names
+    flags = "-array_out -track_only -index_order"
+    keys = list(tao.lat_list(f"{branch}>>*", "ele.key", flags=flags))
+    names = list(tao.lat_list(f"{branch}>>*", "ele.name", flags=flags))
+    seen: list[str] = []
+    for key, name in zip(keys, names):
+        if str(key).lower() in _CAPTURE_KEYS and name and name not in seen:
+            seen.append(str(name))
+    return seen
 
 
 def simulator_from_tao(
@@ -1318,7 +1325,13 @@ def simulator_from_tao(
 
     if ele is None:
         ele = "BEGINNING" if branch == 0 else f"{branch}>>0"
-    capture_at = capture_points_from_tao(tao, branch=branch) if capture else []
+    # Only from the translated lattice: names taken from Tao would not match a
+    # user-supplied one, and would capture nothing without saying so.
+    capture_at = (
+        capture_points_from_tao(tao, branch=branch)
+        if capture and lattice is None
+        else []
+    )
     reference, particles = beam_from_tao(tao, ele, species=species)
     if lattice is None:
         lattice = lattice_from_tao(
@@ -1361,7 +1374,9 @@ def model_from_tao(
         Skip re-tracking on ``set()``, to batch several writes into one run.
     **kwargs
         Passed to :func:`simulator_from_tao`, e.g. ``ele``, ``lattice``, ``nslice``,
-        ``species``, ``settings``, ``skip_unsupported``.
+        ``species``, ``settings``, ``skip_unsupported``. ``capture`` defaults to False
+        here, because no generated variable reads the captured bunches and the model
+        re-tracks on every ``set()``.
 
     Returns
     -------
@@ -1378,6 +1393,12 @@ def model_from_tao(
     """
     from lume_impactx.model import LUMEImpactXModel
 
+    # capture defaults off here, unlike simulator_from_tao. A LUMEModel re-tracks on
+    # every set(), and lume_impactx.config generates no variable from the captures --
+    # only particles:initial_particles and particles:final_particles -- so the model
+    # would pay a measured ~9x tracking cost, and hold a ParticleGroup per marker, for
+    # data nothing exposes. Pass capture=True to opt in.
+    kwargs.setdefault("capture", False)
     simulator = simulator_from_tao(tao, **kwargs)
     return LUMEImpactXModel.from_simulator(
         simulator, config=config, dummy_run=dummy_run

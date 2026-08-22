@@ -172,6 +172,26 @@ def resistive_wall_wake(
     return np.where(s >= 0.0, wake, 0.0)
 
 
+def _refuse_under_mpi() -> None:
+    """Raise if more than one MPI rank is active.
+
+    The wake convolution needs the whole bunch's line charge density. Every rank holds
+    only a fraction, and nothing here reduces across ranks, so the result would be
+    silently wrong rather than merely approximate.
+    """
+    try:
+        from mpi4py import MPI
+    except ImportError:  # pragma: no cover - no MPI build
+        return
+    if MPI.COMM_WORLD.Get_size() > 1:
+        raise NotImplementedError(
+            "The wake model is rank-local: it bins and convolves only the particles on "
+            "this rank, so on "
+            f"{MPI.COMM_WORLD.Get_size()} ranks the line charge density would be wrong. "
+            "Run this on a single rank."
+        )
+
+
 def apply_longitudinal_wake(
     particle_container,
     wake_function,
@@ -207,6 +227,12 @@ def apply_longitudinal_wake(
 
     # ImpactX position_t is c*(t_i - t_ref) in metres, and *increasing* t means the
     # particle arrives later, i.e. sits further back in the bunch.
+    # Rank-local by construction: both the bin range and the histogram below come from
+    # this rank's particles, so on several ranks each would convolve a different binning
+    # of a fraction of the charge. ImpactX's own wake globally reduces both
+    # (HandleWakefield.H). Refuse rather than return a quietly wrong answer.
+    _refuse_under_mpi()
+
     tiles = []
     for level in range(particle_container.finest_level + 1):
         for tile in ImpactXParIter(particle_container, level=level):
@@ -315,6 +341,17 @@ def ResistiveWallWake(
         # total right whatever nslice is set to, instead of silently multiplying the
         # wake by nslice.
         slices = max(int(getattr(element, "nslice", 1) or 1), 1)
+        if slices != 1 and "nslice" not in warned:
+            warned.add("nslice")
+            warnings.warn(
+                f"{name}: a thin wake kick has no reason to be sliced. The kick is "
+                f"split {slices} ways so the total stays right, but that count is read "
+                "from the element this factory returned -- if you append it to a raw "
+                "ImpactX lattice, which copies it, and then slice the copy, the two "
+                "disagree and the wake is applied too strongly.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         if getattr(element, "ds", 0.0) and "ds" not in warned:
             warned.add("ds")
             warnings.warn(
@@ -342,7 +379,7 @@ def ResistiveWallWake(
 
     element.push = push
     element.ref_particle = advance_reference
-    # Keep the closures alive for as long as the element is: pybind stores them without
-    # owning them, and a garbage-collected callback is a crash rather than an error.
-    element._lume_impactx_hooks = (push, advance_reference)
+    # No Python-side reference is kept: pybind's std::function caster holds a counted
+    # reference of its own. Verified by dropping every name and forcing a collection --
+    # the hook still fires.
     return element

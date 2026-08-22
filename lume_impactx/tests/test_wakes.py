@@ -8,11 +8,8 @@ charge and length -- rather than on regression numbers.
 from __future__ import annotations
 
 import numpy as np
-import inspect
 
 import pytest
-
-from lume_impactx import wakes
 
 from lume_impactx.wakes import (
     C_LIGHT,
@@ -266,27 +263,68 @@ def _wake_distribution():
     )
 
 
-def test_the_wake_uses_the_whole_bunch_not_one_tile():
+def test_the_wake_kicks_every_particle_across_every_tile():
     """A wake needs the whole line charge density, so the hook choice matters.
 
-    ImpactX offers two Programmable hooks, and they deliver very different things.
-    Measured on a 200k-particle bunch:
+    ImpactX's two Programmable hooks deliver very different things. Measured on a
+    200k-particle bunch::
 
-      push            1 call,  200000 particles  (the whole container)
-      beam_particles  14 calls,  14286 particles each (one per tile)
+        push            1 call,  200000 particles (the whole container)
+        beam_particles  14 calls,  14286 particles each (one per tile)
 
-    `beam_particles` is the high-performance per-tile hook. Using it here would compute
-    the line density from a fragment of the bunch and silently scale the wake wrong, so
-    this guards the choice of `push` against a well-meaning optimisation.
+    `beam_particles` is the high-performance per-tile hook; using it here would compute
+    the line density from a fragment and scale the wake wrong.
+
+    This asserts the behaviour rather than the source text. An earlier version of this
+    test read `inspect.getsource` for "element.push = push", which a wake that gathered
+    only the first tile passed happily, and a rename of the inner function failed.
     """
-    from lume_impactx.wakes import ResistiveWallWake
+    import numpy as np
+    from impactx import ImpactX, ImpactXParIter
 
-    factory = inspect.getsource(ResistiveWallWake)
-    assert "element.push = push" in factory
-    # The per-tile hook must be left alone.
-    assert "beam_particles" not in factory
+    from lume_impactx.wakes import apply_longitudinal_wake, resistive_wall_wake
 
-    # And the gather really is over every tile, at every level.
-    source = inspect.getsource(wakes.apply_longitudinal_wake)
-    assert "finest_level" in source
-    assert "ImpactXParIter" in source
+    simulator = ImpactX()
+    simulator.verbose = 0
+    simulator.tiny_profiler = False
+    simulator.space_charge = False
+    simulator.diagnostics = False
+    simulator.slice_step_diagnostics = False
+    simulator.init_grids()
+    simulator.beam.ref.set_species("electron").set_kin_energy_MeV(100.0)
+    simulator.add_particles(1e-9, _wake_distribution(), 2000)
+
+    def tiles(container):
+        return [
+            tile.soa().to_xp()
+            for level in range(container.finest_level + 1)
+            for tile in ImpactXParIter(container, level=level)
+        ]
+
+    beam = simulator.beam
+    before = [np.array(soa.real["momentum_t"], copy=True) for soa in tiles(beam)]
+    if len(before) < 2:
+        # A sequential build (the PyPI impactx-noacc wheel) keeps the container in one
+        # piece, where "first tile only" and "all tiles" are the same thing. Skipping
+        # is honest: the OpenMP conda build splits 2000 particles into 14 tiles and
+        # does exercise it.
+        simulator.finalize()
+        pytest.skip(
+            f"this ImpactX build put the bunch in {len(before)} tile(s), so the "
+            "multi-tile gathering path cannot be exercised here"
+        )
+
+    apply_longitudinal_wake(
+        beam,
+        lambda s: resistive_wall_wake(s, 0.01, 5.96e7),
+        length=1.0,
+        num_bins=64,
+    )
+
+    after = [np.asarray(soa.real["momentum_t"]) for soa in tiles(beam)]
+    moved = sum(int(np.count_nonzero(a - b)) for a, b in zip(after, before))
+    total = sum(len(a) for a in after)
+    assert total == 2000
+    # Every particle in every tile, not just the first tile's share.
+    assert moved == total, f"only {moved} of {total} particles were kicked"
+    simulator.finalize()

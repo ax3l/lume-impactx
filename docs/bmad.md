@@ -37,9 +37,19 @@ sim.particles["BEGINNING"]      # and at the start
 
 `particles` is keyed by **Bmad element name**, and lookup is case-insensitive because
 Tao returns names upper case. Every Bmad `marker`, `monitor` and `instrument` is
-captured, which is what Impact-Z's `write_beam_eles=("monitor::*", "marker::*")` does,
-so a mid-lattice monitor called `SCREEN1` shows up as `sim.particles["screen1"]`. The
-LUME spellings `initial` and `final` always work too.
+captured — a superset of Impact-Z's `write_beam_eles=("monitor::*", "marker::*")` — so a
+mid-lattice monitor called `SCREEN1` shows up as `sim.particles["screen1"]`.
+
+Names are not unique, and the mapping does not pretend otherwise:
+
+- A line that **uses one element twice** gives two elements with one name. Occurrences
+  after the first become `SCREEN1##2`, `SCREEN1##3`, in beam order.
+- Tracking **several periods** fires the hook once per element per turn. Turns after the
+  first append `@2`, `@3`.
+
+`initial`, `beginning`, `final` and `end` are reserved: they always mean the run's own
+endpoints, so a captured element cannot shadow them. lume-impact's own spellings,
+`initial_particles` and `final_particles`, work too.
 
 Capture is in memory and does **not** modify the lattice. It uses ImpactX's
 `sim.hook["after_element"]`, reading `sim.beam.to_df()` at the element's exit — the
@@ -54,9 +64,19 @@ as a probe only by accident of being built with `nslice=1`. ImpactX's own `BeamM
 is the other alternative, but it writes openPMD to disk, which would leave a trail of
 files behind a get/set loop.
 
-Each capture copies one `ParticleGroup`, so pass `capture=False` to switch it off; the
-ends still resolve, from the run's own initial and final bunches. `capture_at` on the
-simulator takes the same list of element names directly.
+!!! warning "Capture is not free"
+    Each capture copies a whole `ParticleGroup`. Measured on 50 000 particles with 42
+    capture points, tracking went from 289 ms to 2590 ms — a **9× slowdown** — and held
+    151 MB. Pass `capture=False` to switch it off; the ends still resolve, from the
+    run's own initial and final bunches.
+
+    `LUMEImpactXModel.from_tao` therefore defaults to `capture=False`: a LUME model
+    re-tracks on every `set()`, and no generated variable reads the captured bunches.
+    Pass `capture=True` to opt in.
+
+`capture_at` on the simulator takes the same list of element names directly, matched
+case-insensitively. Names that never match an element warn after the run rather than
+silently capturing nothing.
 
 ## Driving it as a LUME model
 

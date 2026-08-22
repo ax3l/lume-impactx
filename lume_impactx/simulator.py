@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import copy
 import logging
+import warnings
+from collections.abc import Mapping
 from typing import Any
 
 from lume_impactx._mpi import ensure_external_mpi
@@ -89,39 +91,55 @@ def _matrix_to_numpy(matrix: Any):
     return np.asarray(matrix)  # pragma: no cover - already an array
 
 
-class _CaseInsensitiveParticles(dict):
-    """A ``dict`` of ParticleGroups whose keys ignore case.
+class ParticleGroups(Mapping):
+    """Bunches by name, looked up case-insensitively.
 
-    Bmad element names come out of Tao upper case (``END``), while the LUME house names
-    are lower case (``final_particles``). Rather than pick one and surprise half the
-    users, both work.
+    A read-only ``Mapping`` rather than a ``dict`` subclass on purpose. Overriding only
+    ``__getitem__``/``__contains__``/``get`` on a ``dict`` leaves every other entry
+    point disagreeing with them: ``"end" in p`` says True while ``p.pop("end")`` raises,
+    ``setdefault`` quietly creates a second key differing only in case, and ``{**p}``
+    loses the behaviour entirely. Nothing here needs to be mutable -- the property
+    builds a fresh object on each access -- so a Mapping is both simpler and honest.
+
+    Bmad element names arrive from Tao upper case (``END``) while the LUME names are
+    lower (``final_particles``), which is why lookup folds case.
     """
 
-    def __getitem__(self, key: str):
-        try:
-            return super().__getitem__(key)
-        except KeyError:
-            pass
-        lowered = str(key).lower()
-        for name, value in self.items():
-            if str(name).lower() == lowered:
-                return value
-        raise KeyError(
-            f"No bunch named {key!r}. Available: {sorted(self)}. Put a "
-            "lume_impactx.elements.beam_capture() in the lattice to add one."
-        )
+    def __init__(self, entries: dict[str, Any]) -> None:
+        self._entries = dict(entries)
+        self._index: dict[str, str] = {}
+        for key in self._entries:
+            self._index.setdefault(str(key).lower(), key)
 
-    def __contains__(self, key: object) -> bool:
-        if super().__contains__(key):
-            return True
-        lowered = str(key).lower()
-        return any(str(name).lower() == lowered for name in self)
+    def __getitem__(self, key: str) -> ParticleGroup:
+        actual = self._index.get(str(key).lower())
+        if actual is None:
+            raise KeyError(
+                f"No bunch named {key!r}. Available: {sorted(self._entries)}. Pass "
+                "capture_at=[...] to the simulator, or capture=True to from_tao(), to "
+                "keep the bunch at a named element."
+            )
+        value = self._entries[actual]
+        if isinstance(value, Exception):
+            # Deferred from the run, as final_particles does: a bunch carrying data
+            # with no ParticleGroup representation is a usable run, just not a usable
+            # hand-off, so the refusal surfaces where it actually matters.
+            raise value
+        if value is None:
+            raise RuntimeError(
+                f"The bunch at {actual!r} was not gathered. On more than one MPI rank "
+                "each rank sees only its own particles."
+            )
+        return value
 
-    def get(self, key, default=None):
-        try:
-            return self[key]
-        except KeyError:
-            return default
+    def __iter__(self):
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({sorted(self._entries)})"
 
 
 class ImpactXSimulator:
@@ -235,7 +253,9 @@ class ImpactXSimulator:
             A Tao instance with a tracked beam saved at the start element.
         **kwargs
             Passed to :func:`~lume_impactx.interfaces.bmad.simulator_from_tao`, e.g.
-            ``ele``, ``lattice``, ``nslice``, ``skip_unsupported``, ``settings``.
+            ``ele``, ``lattice``, ``nslice``, ``skip_unsupported``, ``branch``,
+            ``settings``, and ``capture`` -- which keeps the bunch at every Bmad marker,
+            monitor and instrument, at a real cost in time and memory.
 
         Examples
         --------
@@ -437,6 +457,18 @@ class ImpactXSimulator:
         finally:
             sim.finalize()
 
+        missing = {
+            str(name).lower() for name in getattr(self, "capture_at", None) or ()
+        }
+        missing -= getattr(self, "_captured_names", set())
+        if missing:
+            warnings.warn(
+                f"capture_at names never matched an element: {sorted(missing)}. "
+                f"The lattice has {sorted({str(getattr(e, 'name', '') or '') for e in self.lattice} - {''})}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         self.track_count += 1
         return self._results
 
@@ -451,9 +483,15 @@ class ImpactXSimulator:
         (measured: ``nslice=4`` gives four calls) -- so it only behaves as a probe by
         accident of being built with ``nslice=1``.
 
-        The hook fires exactly once per element and carries ``sim.tracking_element``, so
-        the bunch is taken at the element's exit, with the reference particle already
-        where that element left it.
+        The hook fires exactly once per element, per period, and carries
+        ``sim.tracking_element``, so the bunch is taken at the element's exit with the
+        reference particle already where that element left it.
+
+        Names are not unique. A line that uses one element twice gives two elements with
+        one name, and a lattice tracked for several periods gives one name per turn, so
+        keying a flat dict by name alone silently keeps only the last -- measured: three
+        monitors called ``SCR`` collapsed to one. Repeats therefore become ``SCR##2``,
+        ``SCR##3`` in beam order, and turns after the first append ``@2``, ``@3``.
 
         Returns
         -------
@@ -461,26 +499,37 @@ class ImpactXSimulator:
             Filled in as tracking proceeds; read it after ``track_particles()``.
         """
         captured: dict[str, Any] = {}
-        # getattr, not attribute access: archive.load_archive rebuilds an instance with
-        # __new__ and assigns fields, so an older archive may not carry this one.
         capture_at = getattr(self, "capture_at", None)
         if not capture_at:
             return captured
-        wanted = {str(name) for name in capture_at}
+        # Matched case-insensitively, because the lookup side is: taking a name from a
+        # Tao lattice and getting nothing back was silent before.
+        wanted = {str(name).lower() for name in capture_at}
+        seen: dict[tuple[int, str], int] = {}
+        self._captured_names = set()
 
         def after_element(instance) -> None:
             element = getattr(instance, "tracking_element", None)
             name = str(getattr(element, "name", "") or "")
-            if name in wanted:
-                # _snapshot_particles reads instance.beam.to_df(local=True) and takes
-                # the reference from beam.ref, which at an after_element hook is where
-                # that element left it -- so a probe downstream of a bend or an
-                # accelerating cavity is converted against the right frame.
-                captured[name] = self._snapshot_particles(instance.beam)
+            if name.lower() not in wanted:
+                return
+            period = int(getattr(instance, "tracking_period", 0) or 0)
+            occurrence = seen.get((period, name), 0) + 1
+            seen[(period, name)] = occurrence
+            label = name if occurrence == 1 else f"{name}##{occurrence}"
+            if period:
+                label = f"{label}@{period + 1}"
+            # _snapshot_particles reads instance.beam.to_df(local=True) and takes the
+            # reference from beam.ref, which at an after_element hook is where that
+            # element left it -- so a probe downstream of a bend or an accelerating
+            # cavity is converted against the right frame.
+            captured[label] = self._snapshot_particles(instance.beam)
+            self._captured_names.add(name.lower())
 
+        # No reference is kept to this callback on purpose: pybind's std::function
+        # caster holds a counted reference, verified by dropping every Python-side name
+        # and forcing a collection -- the hook still fires.
         sim.hook["after_element"] = after_element
-        # pybind stores the callback without owning it; a collected callback is a crash.
-        self._capture_hook = after_element
         return captured
 
     def run(self) -> dict[str, Any]:
@@ -494,21 +543,25 @@ class ImpactXSimulator:
         return self.track()
 
     @property
-    def particles(self) -> dict[str, ParticleGroup]:
+    def particles(self) -> ParticleGroups:
         """Bunches by name, in the style of lume-impact's ``Impact.particles``.
 
-        Always carries the ends of the lattice, under both the LUME names and the Bmad
-        ones, so a Tao user can ask for what they would ask Tao for::
+        Always carries the ends of the lattice, under the LUME names and the Bmad ones,
+        so a Tao user can ask for what they would ask Tao for::
 
             sim = ImpactXSimulator.from_tao(tao)
             sim.run()
             sim.particles["end"]          # same bunch as sim.final_particles
             sim.particles["beginning"]
 
-        Any :func:`~lume_impactx.elements.beam_capture` probe in the lattice appears
-        under its own name too. :meth:`from_tao` puts one at every Bmad ``marker``,
-        ``monitor`` and ``instrument``, which is what Impact-Z's
-        ``write_beam_eles=("monitor::*", "marker::*")`` does.
+        lume-impact's own spellings, ``initial_particles`` and ``final_particles``,
+        work too -- they are what its parsers produce and what
+        :mod:`lume_impactx.config` names its variables.
+
+        Anything named in :attr:`capture_at` appears under its own name;
+        :meth:`from_tao` fills that in from the Bmad markers and monitors. A repeated
+        element name becomes ``NAME##2``, ``NAME##3`` in beam order, and turns after the
+        first append ``@2``, ``@3``.
 
         Lookup is case-insensitive, because Bmad element names arrive upper case.
 
@@ -518,21 +571,25 @@ class ImpactXSimulator:
             If nothing has been tracked yet.
         """
         results = self.results
-        by_name = _CaseInsensitiveParticles(results.get("captured_particles") or {})
+        entries: dict[str, Any] = {}
 
-        def alias(*names, bunch):
-            # `in` is case-insensitive here, so a captured BEGINNING already answers
-            # "beginning" and only the LUME spelling still needs adding.
-            if bunch is None:
-                return
-            for name in names:
-                if name not in by_name:
-                    by_name[name] = bunch
-
-        alias("initial", "beginning", bunch=self.initial_particles)
+        # The four LUME names are reserved: they must keep meaning the run's own
+        # endpoints. A captured element may share a name -- BEGINNING is the same bunch
+        # as `initial` on a single-turn run -- but across several periods it is not, and
+        # letting a capture win the alias made `beginning` and `initial` disagree.
+        initial = self.initial_particles
         final = results.get("final_particles")
-        alias("final", "end", bunch=final if isinstance(final, ParticleGroup) else None)
-        return by_name
+        for names, bunch in (
+            (("initial", "beginning", "initial_particles"), initial),
+            (("final", "end", "final_particles"), final),
+        ):
+            if bunch is not None:
+                for name in names:
+                    entries[name] = bunch
+
+        for name, bunch in (results.get("captured_particles") or {}).items():
+            entries.setdefault(name, bunch)
+        return ParticleGroups(entries)
 
     def reset(self) -> dict[str, Any]:
         """Restore the construction-time lattice, reference and settings, then track."""

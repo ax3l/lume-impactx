@@ -818,8 +818,14 @@ def test_an_unknown_particle_name_says_what_is_available(tao):
     from lume_impactx import ImpactXSimulator
 
     simulator = ImpactXSimulator.from_tao(tao, nslice=8)
-    with pytest.raises(KeyError, match="beam_capture"):
+    with pytest.raises(KeyError) as caught:
         simulator.particles["nowhere"]
+    message = str(caught.value)
+    # The names it does have, and the way to add one -- not a function that no longer
+    # exists, which an earlier version of this test pinned in place.
+    assert "beginning" in message
+    assert "capture_at" in message
+    assert "beam_capture" not in message
 
 
 def test_capture_does_not_touch_the_lattice(tao):
@@ -855,3 +861,178 @@ def test_capture_can_be_turned_off(tao):
         simulator.final_particles["sigma_x"]
     )
     assert "BEGINNING" in simulator.particles
+
+
+# -- capture, tested where it actually bites -------------------------------------------
+#
+# The FODO fixture has only BEGINNING and END, whose names resolve from the run's own
+# initial/final bunches even with capture switched off. So none of the tests above
+# exercise the hook at all: stubbing `_install_capture_hook` to `return {}` leaves them
+# green. These use a lattice with interior monitors, where only a real capture answers.
+
+
+@pytest.fixture
+def tao_with_beam(tmp_path, monkeypatch):
+    """A Tao model with a tracked beam, from an inline lattice."""
+    counter = itertools.count()
+
+    def build(body: str, line: str, e_tot: float = 100e6):
+        directory = tmp_path / f"beam{next(counter)}"
+        directory.mkdir()
+        (directory / "lat.bmad").write_text(
+            f"parameter[geometry] = open\nparameter[particle] = electron\n"
+            f"parameter[e_tot] = {e_tot}\nbeginning[beta_a] = 10\n"
+            f"beginning[beta_b] = 10\n{body}\nlat: line = ({line})\nuse, lat\n"
+        )
+        (directory / "tao.init").write_text(
+            "&tao_start\n/\n&tao_design_lattice\n"
+            '  design_lattice(1)%file = "lat.bmad"\n/\n'
+            "&tao_beam_init\n  beam_init%n_particle = 400\n"
+            "  beam_init%a_norm_emit = 1e-6\n  beam_init%b_norm_emit = 1e-6\n"
+            "  beam_init%bunch_charge = 1e-9\n  beam_init%sig_pz = 1e-3\n"
+            "  beam_init%sig_z = 6e-4\n/\n"
+        )
+        monkeypatch.chdir(directory)
+        instance = pytao.Tao(init_file="tao.init", noplot=True)
+        instance.cmd("set global track_type = beam")
+        instance.cmd("set beam saved_at = *")
+        return instance
+
+    return build
+
+
+MONITORED = "mon: monitor\nqf: quadrupole, l = 0.2, k1 = 2.0\ndd: drift, l = 0.5"
+
+
+def test_a_mid_lattice_monitor_matches_tao(tao_with_beam):
+    """The claim the docs make, finally tested: a monitor in the middle is captured.
+
+    This is what the hook is for, and it is checked against Tao rather than against the
+    translator's own final bunch.
+    """
+    from lume_impactx import ImpactXSimulator
+
+    tao = tao_with_beam(MONITORED, "dd, qf, mon, dd, qf")
+    simulator = ImpactXSimulator.from_tao(tao, nslice=8)
+
+    assert "MON" in simulator.particles
+    captured = simulator.particles["MON"]
+    reference = tao.particles("MON")
+    assert captured.n_particle == reference.n_particle
+    for key in ("sigma_x", "sigma_y", "norm_emit_x", "mean_energy"):
+        assert captured[key] == pytest.approx(reference[key], rel=1e-6), key
+    # And it is genuinely mid-lattice, not the final bunch under another name.
+    assert captured["sigma_x"] != pytest.approx(
+        simulator.final_particles["sigma_x"], rel=1e-3
+    )
+
+
+def test_a_repeated_element_name_keeps_every_occurrence(tao_with_beam):
+    """Regression: a flat dict keyed by name kept only the last of three monitors."""
+    from lume_impactx import ImpactXSimulator
+
+    tao = tao_with_beam(MONITORED, "mon, dd, qf, mon, dd, qf, mon")
+    simulator = ImpactXSimulator.from_tao(tao, nslice=8)
+
+    assert {"MON", "MON##2", "MON##3"} <= set(simulator.particles)
+    # Tao numbers the occurrences too; each must match its own one.
+    for label, index in (("MON", 1), ("MON##2", 4), ("MON##3", 7)):
+        reference = tao.particles(index)
+        assert simulator.particles[label]["sigma_x"] == pytest.approx(
+            reference["sigma_x"], rel=1e-6
+        ), label
+
+
+def test_several_periods_do_not_overwrite_the_first_turn(tao_with_beam):
+    """Regression: `after_element` fires per element *per turn*, so a flat dict kept
+    the last turn -- and `beginning` then disagreed with `initial`."""
+    from lume_impactx import ImpactXSimulator
+
+    tao = tao_with_beam(MONITORED, "mon, dd, qf")
+    simulator = ImpactXSimulator.from_tao(tao, nslice=8, settings={"periods": 3})
+    particles = simulator.particles
+
+    assert {"MON", "MON@2", "MON@3"} <= set(particles)
+    # The reserved LUME names keep meaning the run's own endpoints.
+    assert particles["beginning"]["sigma_x"] == pytest.approx(
+        particles["initial"]["sigma_x"]
+    )
+    assert particles["initial"]["sigma_x"] == pytest.approx(
+        simulator.initial_particles["sigma_x"]
+    )
+    # Turn 1 is not turn 3.
+    assert particles["MON"]["sigma_x"] != pytest.approx(
+        particles["MON@3"]["sigma_x"], rel=1e-6
+    )
+
+
+def test_capture_at_matching_ignores_case_and_reports_misses(tao_with_beam):
+    """Regression: matching was case-sensitive while lookup was not, so a name taken
+    from a Tao lattice could silently capture nothing."""
+    from lume_impactx import ImpactXSimulator
+
+    tao = tao_with_beam(MONITORED, "dd, mon, qf")
+    simulator = ImpactXSimulator.from_tao(tao, nslice=8, capture=False)
+
+    simulator.capture_at = ["mon"]  # the element is named MON
+    simulator.track()
+    assert "MON" in simulator.particles
+
+    simulator.capture_at = ["nowhere"]
+    with pytest.warns(RuntimeWarning, match="never matched an element"):
+        simulator.track()
+
+
+def test_particles_uses_lume_impacts_own_spellings(tao):
+    """lume-impact's parsers key these `initial_particles`/`final_particles`, and
+    lume_impactx.config names its variables the same way."""
+    from lume_impactx import ImpactXSimulator
+
+    particles = ImpactXSimulator.from_tao(tao, nslice=8).particles
+    for name in ("initial_particles", "final_particles", "initial", "final"):
+        assert name in particles, name
+
+
+def test_the_particles_mapping_is_consistent():
+    """Regression: as a `dict` subclass, `"end" in p` was True while `p.pop("end")`
+    raised, `setdefault` created a second key differing only in case, and `{**p}` lost
+    the behaviour entirely."""
+    from lume_impactx.simulator import ParticleGroups
+
+    mapping = ParticleGroups({"END": "bunch"})
+    assert "end" in mapping and "END" in mapping and "End" in mapping
+    assert mapping["end"] == "bunch"
+    assert dict(mapping) == {"END": "bunch"}
+    assert list(mapping) == ["END"]
+    assert len(mapping) == 1
+    assert not hasattr(mapping, "setdefault")  # immutable: no way to split a key
+    with pytest.raises(KeyError):
+        mapping["nope"]
+
+
+def test_an_unrepresentable_capture_raises_where_it_matters():
+    """A capture that could not be converted must not masquerade as a missing key."""
+    from lume_impactx.simulator import ParticleGroups
+    from lume_impactx.utils import UnrepresentableParticleData
+
+    mapping = ParticleGroups({"MID": UnrepresentableParticleData("spin")})
+    with pytest.raises(UnrepresentableParticleData):
+        mapping["MID"]
+
+
+def test_captured_bunches_survive_an_archive(tao_with_beam, tmp_path):
+    """Regression: the archive restored `capture_at` but not the captures, so a loaded
+    simulator claimed a probe it could not produce."""
+    from lume_impactx import ImpactXSimulator, archive, load_archive
+
+    tao = tao_with_beam(MONITORED, "dd, mon, qf")
+    simulator = ImpactXSimulator.from_tao(tao, nslice=8)
+    path = tmp_path / "sim.h5"
+    archive(simulator, str(path))
+
+    restored = load_archive(str(path))
+    assert restored.capture_at == simulator.capture_at
+    assert "MON" in restored.particles
+    assert restored.particles["MON"]["sigma_x"] == pytest.approx(
+        simulator.particles["MON"]["sigma_x"], rel=1e-12
+    )
