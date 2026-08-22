@@ -50,6 +50,7 @@ through the LUME model interface, so an ImpactX lattice can be driven by the sam
 | `lume_impactx.wakes` | Resistive-wall wakefield as a drop-in lattice element. |
 | `ImpactXSimulator.from_tao` | Build a simulation from a Bmad/Tao model — beam and lattice, element by element. |
 | `LUMEImpactXModel.from_tao` | The same, straight to a LUME model with generated variables. |
+| `sim.run()` / `sim.particles["end"]` | The lume-impact three-verb shape: `.from_tao()`, `.run()`, `.particles[...]` keyed by Bmad element name. |
 
 ## Installation
 

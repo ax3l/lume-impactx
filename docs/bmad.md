@@ -22,6 +22,31 @@ Bmad and pytao are **not dependencies** — install them from conda-forge:
 conda install -c conda-forge bmad pytao
 ```
 
+## `.from_tao()`, `.run()`, `.particles[...]`
+
+The same three-verb shape lume-impact uses, so a Tao model can be driven the way you
+would drive Impact-T or Impact-Z:
+
+```python
+sim = ImpactXSimulator.from_tao(tao)
+sim.run()                       # an alias for .track()
+
+sim.particles["end"]            # the bunch at the end of the lattice
+sim.particles["BEGINNING"]      # and at the start
+```
+
+`particles` is keyed by **Bmad element name**, and lookup is case-insensitive because
+Tao returns names upper case. Every Bmad `marker`, `monitor` and `instrument` is
+captured, which is what Impact-Z's `write_beam_eles=("monitor::*", "marker::*")` does,
+so a mid-lattice monitor called `SCREEN1` shows up as `sim.particles["screen1"]`. The
+LUME spellings `initial` and `final` always work too.
+
+Capture is in memory — a zero-length
+[`beam_capture`](api/bmad.md) probe rather than ImpactX's file-writing `BeamMonitor` —
+so a get/set loop leaves no trail of files. It costs one `ParticleGroup` copy per marker,
+so pass `capture=False` to switch it off; the ends still resolve, from the run's own
+initial and final bunches.
+
 ## Driving it as a LUME model
 
 `ImpactXSimulator.from_tao` gives you a simulation. `LUMEImpactXModel.from_tao` goes one

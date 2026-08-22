@@ -89,6 +89,41 @@ def _matrix_to_numpy(matrix: Any):
     return np.asarray(matrix)  # pragma: no cover - already an array
 
 
+class _CaseInsensitiveParticles(dict):
+    """A ``dict`` of ParticleGroups whose keys ignore case.
+
+    Bmad element names come out of Tao upper case (``END``), while the LUME house names
+    are lower case (``final_particles``). Rather than pick one and surprise half the
+    users, both work.
+    """
+
+    def __getitem__(self, key: str):
+        try:
+            return super().__getitem__(key)
+        except KeyError:
+            pass
+        lowered = str(key).lower()
+        for name, value in self.items():
+            if str(name).lower() == lowered:
+                return value
+        raise KeyError(
+            f"No bunch named {key!r}. Available: {sorted(self)}. Put a "
+            "lume_impactx.elements.beam_capture() in the lattice to add one."
+        )
+
+    def __contains__(self, key: object) -> bool:
+        if super().__contains__(key):
+            return True
+        lowered = str(key).lower()
+        return any(str(name).lower() == lowered for name in self)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
 class ImpactXSimulator:
     """A rebuildable ImpactX simulation.
 
@@ -388,6 +423,7 @@ class ImpactXSimulator:
                 "n_particles": int(beam.total_number_of_particles()),
                 "n_steps": self.n_steps,
                 "run_time": time.monotonic() - start,
+                "captured_particles": self._harvest_captures(),
                 **optics,
             }
         finally:
@@ -395,6 +431,71 @@ class ImpactXSimulator:
 
         self.track_count += 1
         return self._results
+
+    def run(self) -> dict[str, Any]:
+        """Run the simulation. An alias for :meth:`track`.
+
+        Present because the LUME house style for a code wrapper is ``.from_tao()``,
+        ``.run()`` and ``.particles[...]``, as in lume-impact -- see
+        :attr:`particles`. ``track`` is kept as the name that matches ImpactX's own
+        ``track_particles``.
+        """
+        return self.track()
+
+    def _harvest_captures(self) -> dict[str, Any]:
+        """Collect what any :func:`~lume_impactx.elements.beam_capture` probes saw.
+
+        Must run before ``finalize()``: the captures hold ParticleGroups, which are
+        plain numpy, but the elements themselves belong to the torn-down simulation.
+        """
+        captured: dict[str, Any] = {}
+        for element in self.lattice:
+            capture = getattr(element, "_lume_impactx_capture", None)
+            if capture is not None and capture.get("particles") is not None:
+                captured[str(capture["name"])] = capture["particles"]
+                capture["particles"] = None
+        return captured
+
+    @property
+    def particles(self) -> dict[str, ParticleGroup]:
+        """Bunches by name, in the style of lume-impact's ``Impact.particles``.
+
+        Always carries the ends of the lattice, under both the LUME names and the Bmad
+        ones, so a Tao user can ask for what they would ask Tao for::
+
+            sim = ImpactXSimulator.from_tao(tao)
+            sim.run()
+            sim.particles["end"]          # same bunch as sim.final_particles
+            sim.particles["beginning"]
+
+        Any :func:`~lume_impactx.elements.beam_capture` probe in the lattice appears
+        under its own name too. :meth:`from_tao` puts one at every Bmad ``marker``,
+        ``monitor`` and ``instrument``, which is what Impact-Z's
+        ``write_beam_eles=("monitor::*", "marker::*")`` does.
+
+        Lookup is case-insensitive, because Bmad element names arrive upper case.
+
+        Raises
+        ------
+        RuntimeError
+            If nothing has been tracked yet.
+        """
+        results = self.results
+        by_name = _CaseInsensitiveParticles(results.get("captured_particles") or {})
+
+        def alias(*names, bunch):
+            # `in` is case-insensitive here, so a captured BEGINNING already answers
+            # "beginning" and only the LUME spelling still needs adding.
+            if bunch is None:
+                return
+            for name in names:
+                if name not in by_name:
+                    by_name[name] = bunch
+
+        alias("initial", "beginning", bunch=self.initial_particles)
+        final = results.get("final_particles")
+        alias("final", "end", bunch=final if isinstance(final, ParticleGroup) else None)
+        return by_name
 
     def reset(self) -> dict[str, Any]:
         """Restore the construction-time lattice, reference and settings, then track."""

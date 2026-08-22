@@ -125,7 +125,17 @@ def make_tao(tmp_path, monkeypatch):
 
 
 def kinds(lattice):
-    return [type(element).__name__ for element in lattice]
+    """Element type names, with beam-capture probes labelled as such.
+
+    A capture probe is an `elements.Programmable` under the hood, which says nothing
+    useful in a structural assertion.
+    """
+    return [
+        "Capture"
+        if getattr(element, "_lume_impactx_capture", None) is not None
+        else type(element).__name__
+        for element in lattice
+    ]
 
 
 def test_fodo_translates_to_the_models_that_match_bmad(tao):
@@ -140,12 +150,12 @@ def test_fodo_translates_to_the_models_that_match_bmad(tao):
         lattice = lattice_from_tao(tao, nslice=5)
 
     assert kinds(lattice) == [
-        "Marker",  # BEGINNING
+        "Capture",  # BEGINNING
         "ChrQuad",
         "ExactDrift",
         "ChrQuad",
         "ExactDrift",
-        "Marker",  # END
+        "Capture",  # END
     ]
     quad = lattice[1]
     assert quad.ds == pytest.approx(0.25)
@@ -189,7 +199,7 @@ BEND = "b: sbend, l = 0.5, angle = 0.12, e1 = 0.06, e2 = 0.06"
 def test_fringe_type_none_gives_no_edges(make_tao):
     """Adding a DipEdge anyway is wrong by 8.9e-2 on the transfer map."""
     tao = make_tao(f"{BEND}, fringe_type = none", "b")
-    assert kinds(lattice_from_tao(tao)) == ["Marker", "ExactSbend", "Marker"]
+    assert kinds(lattice_from_tao(tao)) == ["Capture", "ExactSbend", "Capture"]
 
 
 def test_bmads_default_bend_fringe_is_a_nonlinear_dipedge(make_tao):
@@ -203,7 +213,7 @@ def test_bmads_default_bend_fringe_is_a_nonlinear_dipedge(make_tao):
         warnings.simplefilter("error", TaoTranslationWarning)
         lattice = lattice_from_tao(tao)
 
-    assert kinds(lattice) == ["Marker", "DipEdge", "ExactSbend", "DipEdge", "Marker"]
+    assert kinds(lattice) == ["Capture", "DipEdge", "ExactSbend", "DipEdge", "Capture"]
     entry, exit_ = lattice[1], lattice[3]
     assert entry.psi == pytest.approx(0.06)
     assert exit_.psi == pytest.approx(0.06)
@@ -222,7 +232,7 @@ def test_a_zero_pole_face_angle_still_gets_an_edge(make_tao):
     """
     tao = make_tao("b: sbend, l = 0.5, angle = 0.12", "b")
     lattice = lattice_from_tao(tao)
-    assert kinds(lattice) == ["Marker", "DipEdge", "ExactSbend", "DipEdge", "Marker"]
+    assert kinds(lattice) == ["Capture", "DipEdge", "ExactSbend", "DipEdge", "Capture"]
     assert lattice[1].psi == 0.0
 
 
@@ -255,10 +265,10 @@ def test_the_fringe_types_that_genuinely_differ_say_so(make_tao):
 def test_fringe_at_selects_which_ends_get_an_edge(make_tao):
     tao = make_tao(f"{BEND}, fringe_at = entrance_end", "b")
     assert kinds(lattice_from_tao(tao)) == [
-        "Marker",
+        "Capture",
         "DipEdge",
         "ExactSbend",
-        "Marker",
+        "Capture",
     ]
 
 
@@ -287,13 +297,13 @@ def test_roll_becomes_a_kick_between_two_half_bends(make_tao):
         lattice = lattice_from_tao(tao, nslice=8)
 
     assert kinds(lattice) == [
-        "Marker",
+        "Capture",
         "DipEdge",
         "ExactSbend",
         "Kicker",
         "ExactSbend",
         "DipEdge",
-        "Marker",
+        "Capture",
     ]
     first, kick, second = lattice[2], lattice[3], lattice[4]
     assert first.ds == pytest.approx(0.25)
@@ -308,11 +318,11 @@ def test_roll_becomes_a_kick_between_two_half_bends(make_tao):
 def test_an_unrolled_bend_is_not_split(make_tao):
     tao = make_tao(BEND, "b")
     assert kinds(lattice_from_tao(tao)) == [
-        "Marker",
+        "Capture",
         "DipEdge",
         "ExactSbend",
         "DipEdge",
-        "Marker",
+        "Capture",
     ]
 
 
@@ -378,7 +388,7 @@ def test_multipoles_use_exact_multipole_at_order_minus_one(make_tao):
         "sx: sextupole, l = 0.2, k2 = 25.0\noc: octupole, l = 0.15, k3 = 80.0", "sx, oc"
     )
     lattice = lattice_from_tao(tao)
-    assert kinds(lattice) == ["Marker", "ExactMultipole", "ExactMultipole", "Marker"]
+    assert kinds(lattice) == ["Capture", "ExactMultipole", "ExactMultipole", "Capture"]
     assert list(lattice[1].to_dict()["k_normal"]) == [0.0, 0.0, 25.0]
     assert list(lattice[2].to_dict()["k_normal"]) == [0.0, 0.0, 0.0, 80.0]
 
@@ -395,7 +405,7 @@ def test_solenoid_uses_the_chromatic_model(make_tao):
         warnings.simplefilter("error", TaoTranslationWarning)
         lattice = lattice_from_tao(tao)
 
-    assert kinds(lattice) == ["Marker", "ChrAcc", "Marker"]
+    assert kinds(lattice) == ["Capture", "ChrAcc", "Capture"]
     solenoid = lattice[1]
     gamma = 100e6 / ELECTRON_MASS_EV
     beta_gamma = math.sqrt(gamma * gamma - 1.0)
@@ -406,7 +416,7 @@ def test_solenoid_uses_the_chromatic_model(make_tao):
 def test_kickers_carry_their_kick(make_tao):
     tao = make_tao("hk: hkicker, kick = 1e-4\nvk: vkicker, kick = -7e-5", "hk, vk")
     lattice = lattice_from_tao(tao)
-    assert kinds(lattice) == ["Marker", "Kicker", "Kicker", "Marker"]
+    assert kinds(lattice) == ["Capture", "Kicker", "Kicker", "Capture"]
     assert lattice[1].xkick == pytest.approx(1e-4)
     assert lattice[1].ykick == 0.0
     assert lattice[2].ykick == pytest.approx(-7e-5)
@@ -423,7 +433,7 @@ def test_a_switched_off_element_keeps_its_length(make_tao):
     tao = make_tao("q: quadrupole, l = 0.3, k1 = 2.0, is_on = F", "q")
     with pytest.warns(TaoTranslationWarning, match="switched off"):
         lattice = lattice_from_tao(tao)
-    assert kinds(lattice) == ["Marker", "ExactDrift", "Marker"]
+    assert kinds(lattice) == ["Capture", "ExactDrift", "Capture"]
     assert lattice[1].ds == pytest.approx(0.3)
 
 
@@ -431,7 +441,7 @@ def test_collimator_limits_become_an_aperture(make_tao):
     """Bmad's aperture_type and aperture_at decide the shape and the placement."""
     tao = make_tao("ec: ecollimator, l = 0.2, x_limit = 0.01, y_limit = 0.008", "ec")
     lattice = lattice_from_tao(tao)
-    assert kinds(lattice) == ["Marker", "ExactDrift", "Aperture", "Marker"]
+    assert kinds(lattice) == ["Capture", "ExactDrift", "Aperture", "Capture"]
     aperture = lattice[2]
     assert aperture.to_dict()["shape"] == "elliptical"
     assert aperture.aperture_x == pytest.approx(0.01)
@@ -472,7 +482,7 @@ def test_an_unsupported_element_raises_and_can_be_skipped(make_tao):
         lattice_from_tao(tao)
     with pytest.warns(TaoTranslationWarning, match="Replaced by a marker"):
         lattice = lattice_from_tao(tao, skip_unsupported=True)
-    assert kinds(lattice) == ["Marker", "Marker", "Marker"]
+    assert kinds(lattice) == ["Capture", "Marker", "Capture"]
 
 
 def test_lcavity_is_supported_and_carries_the_reference_energy(make_tao):
@@ -586,7 +596,7 @@ def test_a_zero_angle_bend_keeps_its_k1(make_tao):
     """Regression: it became a drift, discarding K1 entirely -- 100% wrong."""
     tao = make_tao("b: sbend, l = 0.5, g = 0, k1 = 1.7", "b")
     lattice = lattice_from_tao(tao)
-    assert kinds(lattice) == ["Marker", "ChrQuad", "Marker"]
+    assert kinds(lattice) == ["Capture", "ChrQuad", "Capture"]
     assert lattice[1].k == pytest.approx(1.7)
 
 
@@ -638,7 +648,7 @@ def test_quadrupole_fringe_uses_quadedge(make_tao):
     5.0e-7; with both edges 1.9e-14."""
     tao = make_tao("q: quadrupole, l = 0.3, k1 = 2.0, fringe_type = full", "q")
     lattice = lattice_from_tao(tao)
-    assert kinds(lattice) == ["Marker", "QuadEdge", "ChrQuad", "QuadEdge", "Marker"]
+    assert kinds(lattice) == ["Capture", "QuadEdge", "ChrQuad", "QuadEdge", "Capture"]
     assert lattice[1].to_dict()["flag"] == "entry"
     assert lattice[3].to_dict()["flag"] == "exit"
 
@@ -776,3 +786,63 @@ def test_tracking_matches_bmad(track_both, label, body, line, tolerance):
     # A comparison that returns exactly zero means the two sides were never really
     # compared -- guard against the harness silently degenerating.
     assert 0.0 < worst < tolerance, f"{label}: {worst:.3e}"
+
+
+# -- the lume-impact-style surface -----------------------------------------------------
+
+
+def test_run_is_an_alias_for_track(tao):
+    """`.from_tao()`, `.run()`, `.particles[...]` is the LUME house shape."""
+    from lume_impactx import ImpactXSimulator
+
+    simulator = ImpactXSimulator.from_tao(tao, nslice=8)
+    before = simulator.track_count
+    simulator.run()
+    assert simulator.track_count == before + 1
+    assert simulator.results["final_particles"] is simulator.final_particles
+
+
+def test_particles_are_keyed_by_bmad_element_name(tao):
+    """Every Bmad marker/monitor/instrument is captured, as Impact-Z's
+    write_beam_eles=("monitor::*", "marker::*") does."""
+    from lume_impactx import ImpactXSimulator
+
+    simulator = ImpactXSimulator.from_tao(tao, nslice=16)
+    particles = simulator.particles
+
+    # Bmad names arrive upper case; the LUME names are lower. Both must work.
+    for key in ("END", "end", "End", "final", "BEGINNING", "beginning", "initial"):
+        assert key in particles, key
+
+    for bmad_name, lume_name in (("BEGINNING", "beginning"), ("END", "end")):
+        reference = tao.particles(bmad_name)
+        captured = particles[lume_name]
+        assert captured.n_particle == reference.n_particle
+        for key in ("sigma_x", "sigma_y", "norm_emit_x"):
+            assert captured[key] == pytest.approx(reference[key], rel=1e-6), (
+                f"{bmad_name}:{key}"
+            )
+
+
+def test_an_unknown_particle_name_says_what_is_available(tao):
+    from lume_impactx import ImpactXSimulator
+
+    simulator = ImpactXSimulator.from_tao(tao, nslice=8)
+    with pytest.raises(KeyError, match="beam_capture"):
+        simulator.particles["nowhere"]
+
+
+def test_capture_can_be_turned_off(tao):
+    """The probes cost a ParticleGroup copy per marker, so they are optional."""
+    from lume_impactx import ImpactXSimulator
+
+    lattice = lattice_from_tao(tao, nslice=8, capture=False)
+    assert "Capture" not in kinds(lattice)
+    assert kinds(lattice)[0] == "Marker"
+
+    simulator = ImpactXSimulator.from_tao(tao, nslice=8, capture=False)
+    # The ends still resolve: they come from the run's own initial/final bunches.
+    assert simulator.particles["end"]["sigma_x"] == pytest.approx(
+        simulator.final_particles["sigma_x"]
+    )
+    assert "BEGINNING" in simulator.particles

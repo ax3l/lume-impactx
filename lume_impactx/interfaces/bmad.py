@@ -178,6 +178,10 @@ DRIFT_LIKE_KEYS = frozenset(
     {"drift", "pipe", "monitor", "instrument", "ecollimator", "rcollimator"}
 )
 
+#: Marker-like elements whose bunch is worth capturing, matching Impact-Z's
+#: ``write_beam_eles=("monitor::*", "marker::*")``.
+_CAPTURE_KEYS = frozenset({"marker", "beginning_ele", "monitor", "instrument"})
+
 #: Bmad elements that carry no length and no effect on the beam.
 MARKER_LIKE_KEYS = frozenset(
     {"marker", "beginning_ele", "fork", "photon_fork", "fiducial", "null_ele"}
@@ -616,6 +620,7 @@ def translate_element(
     name: str = "",
     mass_eV: float | None = None,
     momentum_scale: float = 1.0,
+    capture: bool = True,
 ) -> list:
     """Translate one Tao element into zero or more ImpactX elements.
 
@@ -635,6 +640,12 @@ def translate_element(
         ``rfcavity`` while ImpactX's reference particle really is accelerated, so every
         strength Bmad normalises to *its* momentum must be rescaled to ImpactX's.
         :func:`lattice_from_tao` computes it; it is exactly 1 without acceleration.
+    capture : bool
+        Put a :func:`~lume_impactx.elements.beam_capture` probe at every marker-like
+        element, so the bunch there shows up in
+        :attr:`~lume_impactx.simulator.ImpactXSimulator.particles` under the Bmad
+        element's name. This mirrors Impact-Z's
+        ``write_beam_eles=("monitor::*", "marker::*")``.
 
     Returns
     -------
@@ -716,7 +727,14 @@ def translate_element(
     if key in MARKER_LIKE_KEYS or (length == 0.0 and key in DRIFT_LIKE_KEYS):
         # Apertures are computed first: a thin collimator is the canonical way to write
         # one, and returning a bare Marker here silently discarded its limits.
-        return entry_aperture + [elements.Marker(name=name or key)] + exit_aperture
+        label = name or key
+        if capture and key in _CAPTURE_KEYS:
+            from lume_impactx.elements import beam_capture
+
+            marker = beam_capture(label)
+        else:
+            marker = elements.Marker(name=label)
+        return entry_aperture + [marker] + exit_aperture
 
     _check_stray_kicks(info, name, key)
     _check_multipole_errors(info, name)
@@ -1129,6 +1147,7 @@ def lattice_from_tao(
     nslice: int = 8,
     skip_unsupported: bool = False,
     branch: int = 0,
+    capture: bool = True,
 ) -> list:
     """Translate a Tao lattice into ImpactX elements, element by element.
 
@@ -1146,6 +1165,9 @@ def lattice_from_tao(
         Replace an untranslatable element with a marker and warn, instead of raising.
     branch : int
         Lattice branch to translate. Only one branch is translated.
+    capture : bool
+        Put a beam-capture probe at every Bmad marker, monitor and instrument, so those
+        bunches appear in ``simulator.particles`` under the Bmad element's name.
 
     Returns
     -------
@@ -1212,6 +1234,7 @@ def lattice_from_tao(
                 name=element_name,
                 mass_eV=mass_eV,
                 momentum_scale=momentum_scale,
+                capture=capture,
             )
         except UnsupportedElementError as exc:
             if not skip_unsupported:
@@ -1254,6 +1277,7 @@ def simulator_from_tao(
     settings: dict[str, Any] | None = None,
     skip_unsupported: bool = False,
     branch: int = 0,
+    capture: bool = True,
     **kwargs: Any,
 ):
     """Build an :class:`~lume_impactx.simulator.ImpactXSimulator` from a Tao model.
@@ -1277,6 +1301,9 @@ def simulator_from_tao(
         Replace untranslatable elements with markers instead of raising.
     branch : int
         Lattice branch to translate.
+    capture : bool
+        Capture the bunch at every Bmad marker, monitor and instrument, so it appears
+        in ``simulator.particles`` under that element's name.
     **kwargs
         Passed to the simulator, e.g. ``track_on_init``.
 
@@ -1291,7 +1318,11 @@ def simulator_from_tao(
     reference, particles = beam_from_tao(tao, ele, species=species)
     if lattice is None:
         lattice = lattice_from_tao(
-            tao, nslice=nslice, skip_unsupported=skip_unsupported, branch=branch
+            tao,
+            nslice=nslice,
+            skip_unsupported=skip_unsupported,
+            branch=branch,
+            capture=capture,
         )
     return ImpactXSimulator(
         lattice=lattice,
