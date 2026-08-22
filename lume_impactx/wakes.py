@@ -1,4 +1,4 @@
-"""Short-range wakefields, applied as a thin kick.
+r"""Short-range wakefields, applied as a thin kick.
 
 ImpactX has no wakefield lattice element. It ships the numerical primitives --
 ``impactx.wakeconvolution.deposit_charge`` / ``derivative_charge`` / ``w_l_csr`` /
@@ -16,18 +16,15 @@ Model
 The longitudinal wake per unit length of a round pipe of radius ``b`` and conductivity
 ``sigma_c``, in the Bane-Sands short-range form:
 
-.. math::
+$$ s_0 = \left(\frac{2 b^2}{Z_0 \sigma_c}\right)^{1/3} $$
 
-   s_0 = \\left(\\frac{2 b^2}{Z_0 \\sigma_c}\\right)^{1/3}
+$$ W_L(s) = \frac{Z_0 c}{\pi b^2}\left[\frac{1}{3}e^{-s/s_0}\cos(\sqrt{3}s/s_0)
+   - \frac{\sqrt{2}}{\pi}\int_0^\infty
+   \frac{x^2 e^{-x^2 s/s_0}}{x^6+8}\,dx\right] $$
 
-   W_L(s) = \\frac{Z_0 c}{\\pi b^2}\\left[\\frac{1}{3}e^{-s/s_0}\\cos(\\sqrt{3}s/s_0)
-            - \\frac{\\sqrt{2}}{\\pi}\\int_0^\\infty
-              \\frac{x^2 e^{-x^2 s/s_0}}{x^6+8}\\,dx\\right]
-
-for :math:`s \\ge 0`, and zero for :math:`s < 0` (causality). At :math:`s = 0` the
-integral is analytic and the whole expression collapses to
-:math:`W_L(0) = Z_0 c / (4\\pi b^2)`, which :func:`resistive_wall_wake` is tested
-against.
+for $s \ge 0$, and zero for $s < 0$ (causality). At $s = 0$ the integral is analytic
+and the whole expression collapses to $W_L(0) = Z_0 c / (4\pi b^2)$, which
+:func:`resistive_wall_wake` is tested against.
 
 This is the classic short-range approximation: it assumes a round, thick, dc-conducting
 wall and a relativistic beam, and it ignores ac conductivity and surface roughness. It
@@ -58,13 +55,13 @@ C_LIGHT = 299792458.0
 def csr_validity_margin(
     bend_radius: float, sigma_z: float, sigma_transverse: float
 ) -> float:
-    """How comfortably a bunch satisfies the 1D CSR validity condition.
+    r"""How comfortably a bunch satisfies the 1D CSR validity condition.
 
     The 1D CSR model that ImpactX, Bmad and elegant all use projects the bunch onto a
     line, which is only justified when the bunch is transversely thin compared with the
     CSR formation width:
 
-    .. math:: \sigma_\perp \ll R\left(\frac{\sigma_z}{R}\right)^{2/3}
+    $$ \sigma_\perp \ll R\left(\frac{\sigma_z}{R}\right)^{2/3} $$
 
     (Sagan and Mayes, *Coherent Synchrotron Radiation Simulations for Off-Axis Beams
     Using the Bmad Toolkit*, IPAC2017 THPAB076, following Saldin et al.,
