@@ -324,6 +324,7 @@ def test_cumulative_maps_run_from_the_lattice_start(waterbag):
     np.testing.assert_allclose(maps[1][:2, :2], [[1.0, 0.4], [0.0, 1.0]], atol=1e-12)
 
 
+from lume_impactx import actions as actions_module  # noqa: E402
 from lume_impactx.tests.conftest import BUNCH_CHARGE_C, KIN_ENERGY_MEV  # noqa: E402
 
 
@@ -447,3 +448,84 @@ def test_reference_energy_follows_an_accelerating_cavity(fodo_lattice, waterbag)
     before = simulator.reference_energy_at("q")
     after = simulator.reference_energy_at("q##2")
     assert after - before == pytest.approx(gain_eV, rel=1e-9)
+
+
+# -- bases a facility subclasses for its own PVs ---------------------------------------
+
+
+class _QuadKGVariable(actions_module.ImpactXWritableScalarVariable):
+    """A stand-in for a facility's BCTRL: kG from gradient x magnetic rigidity."""
+
+    unit: str = "kG"
+
+    @staticmethod
+    def _rigidity(energy_eV: float) -> float:
+        return 33.356 * energy_eV / 1e9  # kG-m
+
+    def _get(self, simulator):
+        element, energy = self._resolve_element_and_energy(simulator, self.element_name)
+        return element.k * element.ds * self._rigidity(energy)
+
+    def _set(self, simulator, value):
+        element, energy = self._resolve_element_and_energy(simulator, self.element_name)
+        element.k = value / (element.ds * self._rigidity(energy))
+
+
+class _QuadKGReadback(actions_module.ImpactXReadOnlyActionMixin, _QuadKGVariable):
+    """The BACT to that BCTRL: same conversion, no write."""
+
+
+def test_a_facility_can_subclass_the_name_keyed_bases(fodo_simulator):
+    """The conversion logic belongs in the facility's repo; the addressing belongs here.
+
+    This is the shape lume-cheetah exports and SLAC's virtual accelerator subclasses.
+    """
+    control = _QuadKGVariable(name="QUAD1:BCTRL", element_name="quad1")
+
+    kG = control._get(fodo_simulator)
+    assert kG != 0.0
+    control._set(fodo_simulator, kG * 2.0)
+    assert fodo_simulator.ele["quad1"].k == pytest.approx(2.0)  # was 1.0
+    assert control._get(fodo_simulator) == pytest.approx(kG * 2.0)
+
+
+def test_a_readback_reuses_its_controls_conversion(fodo_simulator):
+    """BACT is a one-line subclass of BCTRL, not a second copy of the physics."""
+    from lume.exceptions import ReadOnlyError
+
+    readback = _QuadKGReadback(name="QUAD1:BACT", element_name="quad1")
+    control = _QuadKGVariable(name="QUAD1:BCTRL", element_name="quad1")
+
+    assert readback._get(fodo_simulator) == pytest.approx(control._get(fodo_simulator))
+    assert readback.read_only is True
+    with pytest.raises(ReadOnlyError):
+        readback._set(fodo_simulator, 1.0)
+
+
+def test_the_name_keyed_base_reports_the_energy_at_that_element(fodo_simulator):
+    element, energy = actions_module._ElementByNameMixin._resolve_element_and_energy(
+        fodo_simulator, "quad2"
+    )
+    assert element is fodo_simulator.lattice[3]
+    assert energy == pytest.approx(fodo_simulator.reference_energy_at("quad2"))
+
+
+def test_a_name_keyed_variable_survives_a_lattice_edit(fodo_simulator, fodo_lattice):
+    """Unlike the index-keyed generated variables, a name still finds its element after
+    the lattice is edited -- which is the point of addressing this way."""
+    from impactx import elements as impactx_elements
+
+    control = _QuadKGVariable(name="QUAD1:BCTRL", element_name="quad1")
+    before = control._get(fodo_simulator)
+
+    fodo_simulator.lattice.insert(0, impactx_elements.Drift(name="new", ds=0.1))
+    assert control._get(fodo_simulator) == pytest.approx(before)
+
+
+def test_a_bunch_at_element_variable_reads_a_capture(fodo_simulator):
+    variable = actions_module.ImpactXBunchAtElementVariable(
+        name="probe", element_name="final"
+    )
+    assert variable._get(fodo_simulator)["sigma_x"] == pytest.approx(
+        fodo_simulator.final_particles["sigma_x"]
+    )

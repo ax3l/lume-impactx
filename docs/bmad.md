@@ -287,6 +287,27 @@ edges:
 tao.cmd("set ele * fringe_type = none")
 ```
 
+## Modelling part of a lattice
+
+`track_start` and `track_end` translate only a range, starting from the bunch Tao has
+there:
+
+```python
+sim = ImpactXSimulator.from_tao(tao, track_start="MID", track_end="SCR")
+```
+
+`track_start` names the element the beam is taken *at*, so translation begins with the
+element after it — the bunch has already been through it. `track_end` is inclusive, as
+in Tao. One argument moves both the lattice and the beam, so they cannot disagree, and
+the capture points are restricted to the same range.
+
+Verified against Tao: starting at `MID` reaches the same `END` as tracking the whole
+lattice, to 1e-14.
+
+ImpactX itself has no notion of starting partway through — it tracks whatever is in
+`sim.lattice` — so this is a slice of the translated element list, not an ImpactX
+feature.
+
 ## Branches
 
 `branch` selects which lattice branch to translate, and reaches the beam, the reference

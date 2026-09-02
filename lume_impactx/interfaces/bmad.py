@@ -1129,11 +1129,63 @@ def _element_indices(tao: Any, branch: int) -> list[int]:
     return [int(value) for value in raw]
 
 
+def _restrict_to_range(
+    tao: Any,
+    branch: int,
+    indices: list[int],
+    track_start: str | None,
+    track_end: str | None,
+) -> list[int]:
+    """Narrow the element list to a named range, inclusive of the end element.
+
+    ImpactX has no notion of starting partway through a lattice -- it tracks whatever
+    is in ``sim.lattice`` -- so a partial model is made by translating only part of it.
+    That is a slice of a Python list, which is why this needs nothing from ImpactX.
+
+    ``track_start`` names the element the beam is taken *at*, so translation begins with
+    the element **after** it: the bunch has already been through it. ``track_end`` is
+    included, matching Tao, where ``track_end = "END"`` means the whole lattice.
+    """
+    if track_start is None and track_end is None:
+        return indices
+
+    names = {}
+    for position, index in enumerate(indices):
+        try:
+            name = str(dict(tao.ele_head(f"{branch}>>{index}")).get("name", "") or "")
+        except Exception:  # pragma: no cover - already fatal in the main walk
+            continue
+        # First occurrence wins, as Tao's own bare-name lookup does.
+        names.setdefault(name.lower(), position)
+
+    def position_of(label: str, what: str) -> int:
+        found = names.get(str(label).lower())
+        if found is None:
+            raise ValueError(
+                f"{what}={label!r} is not an element of branch {branch}. "
+                f"The lattice runs {list(names)[:1]} .. {list(names)[-1:]}."
+            )
+        return found
+
+    first = 0 if track_start is None else position_of(track_start, "track_start") + 1
+    last = (
+        len(indices) - 1 if track_end is None else position_of(track_end, "track_end")
+    )
+    if first > last:
+        raise ValueError(
+            f"track_start={track_start!r} is at or after track_end={track_end!r}; "
+            "there would be nothing to track."
+        )
+    return indices[first : last + 1]
+
+
 def lattice_from_tao(
     tao: Any,
     nslice: int = 8,
     skip_unsupported: bool = False,
     branch: int = 0,
+    track_start: str | None = None,
+    track_end: str | None = None,
 ) -> list:
     """Translate a Tao lattice into ImpactX elements, element by element.
 
@@ -1151,6 +1203,11 @@ def lattice_from_tao(
         Replace an untranslatable element with a marker and warn, instead of raising.
     branch : int
         Lattice branch to translate. Only one branch is translated.
+    track_start : str, optional
+        Translate from *after* this element, the one the beam is taken at. The bunch has
+        already been through it, so including it would apply it twice.
+    track_end : str, optional
+        Translate up to and including this element.
 
     Returns
     -------
@@ -1168,7 +1225,9 @@ def lattice_from_tao(
     """
     from impactx import elements
 
-    indices = _element_indices(tao, branch)
+    indices = _restrict_to_range(
+        tao, branch, _element_indices(tao, branch), track_start, track_end
+    )
     if not indices:
         raise ValueError(f"Tao reported no tracked elements in branch {branch}.")
     mass_eV = _reference_mass_eV(tao, branch)
@@ -1250,7 +1309,12 @@ def lattice_from_tao(
 # --------------------------------------------------------------------------------------
 
 
-def capture_points_from_tao(tao: Any, branch: int = 0) -> list[str]:
+def capture_points_from_tao(
+    tao: Any,
+    branch: int = 0,
+    track_start: str | None = None,
+    track_end: str | None = None,
+) -> list[str]:
     """Names of the Bmad elements whose bunch is worth keeping.
 
     Markers, monitors and instruments. Impact-Z's default is narrower --
@@ -1271,6 +1335,18 @@ def capture_points_from_tao(tao: Any, branch: int = 0) -> list[str]:
     flags = "-array_out -track_only -index_order"
     keys = list(tao.lat_list(f"{branch}>>*", "ele.key", flags=flags))
     names = list(tao.lat_list(f"{branch}>>*", "ele.name", flags=flags))
+    if track_start is not None or track_end is not None:
+        # Same range as the lattice, or capture_at would name elements that were never
+        # translated and warn about every one of them after the run.
+        indices = _element_indices(tao, branch)
+        kept = set(_restrict_to_range(tao, branch, indices, track_start, track_end))
+        pairs = [
+            (key, name)
+            for index, key, name in zip(indices, keys, names)
+            if index in kept
+        ]
+        keys = [key for key, _ in pairs]
+        names = [name for _, name in pairs]
     seen: list[str] = []
     for key, name in zip(keys, names):
         if str(key).lower() in _CAPTURE_KEYS and name and name not in seen:
@@ -1288,6 +1364,8 @@ def simulator_from_tao(
     skip_unsupported: bool = False,
     branch: int = 0,
     capture: bool = True,
+    track_start: str | None = None,
+    track_end: str | None = None,
     **kwargs: Any,
 ):
     """Build an :class:`~lume_impactx.simulator.ImpactXSimulator` from a Tao model.
@@ -1297,8 +1375,8 @@ def simulator_from_tao(
     tao : pytao.Tao
         A Tao instance with a tracked beam saved at ``ele``.
     ele : str, optional
-        Element to take the beam and reference particle from. Defaults to the start of
-        ``branch``.
+        Element to take the beam and reference particle from. Defaults to
+        ``track_start`` when given, otherwise the start of ``branch``.
     lattice : list, optional
         ImpactX elements to use. Translated from Tao when omitted.
     nslice : int
@@ -1314,6 +1392,12 @@ def simulator_from_tao(
     capture : bool
         Capture the bunch at every Bmad marker, monitor and instrument, so it appears
         in ``simulator.particles`` under that element's name.
+    track_start : str, optional
+        Model only the lattice downstream of this element, starting from the bunch Tao
+        has there. The default beam element follows it, so one argument moves both the
+        lattice and the beam and they cannot disagree.
+    track_end : str, optional
+        Model up to and including this element.
     **kwargs
         Passed to the simulator, e.g. ``track_on_init``.
 
@@ -1324,11 +1408,18 @@ def simulator_from_tao(
     from lume_impactx.simulator import ImpactXSimulator
 
     if ele is None:
-        ele = "BEGINNING" if branch == 0 else f"{branch}>>0"
+        # track_start is where the beam is taken *and* where the lattice begins, so the
+        # two cannot be set inconsistently by accident.
+        if track_start is not None:
+            ele = track_start
+        else:
+            ele = "BEGINNING" if branch == 0 else f"{branch}>>0"
     # Only from the translated lattice: names taken from Tao would not match a
     # user-supplied one, and would capture nothing without saying so.
     capture_at = (
-        capture_points_from_tao(tao, branch=branch)
+        capture_points_from_tao(
+            tao, branch=branch, track_start=track_start, track_end=track_end
+        )
         if capture and lattice is None
         else []
     )
@@ -1339,6 +1430,8 @@ def simulator_from_tao(
             nslice=nslice,
             skip_unsupported=skip_unsupported,
             branch=branch,
+            track_start=track_start,
+            track_end=track_end,
         )
     return ImpactXSimulator(
         lattice=lattice,

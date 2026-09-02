@@ -1036,3 +1036,82 @@ def test_captured_bunches_survive_an_archive(tao_with_beam, tmp_path):
     assert restored.particles["MON"]["sigma_x"] == pytest.approx(
         simulator.particles["MON"]["sigma_x"], rel=1e-12
     )
+
+
+# -- partial lattices ------------------------------------------------------------------
+#
+# ImpactX has no notion of starting partway through a lattice -- it tracks whatever is
+# in sim.lattice -- so a partial model is made by translating only part of it. That is a
+# list slice, which is why this needs nothing from ImpactX itself.
+
+
+RANGED = (
+    "qf: quadrupole, l = 0.3, k1 = 2.0\n"
+    "qd: quadrupole, l = 0.3, k1 = -2.0\n"
+    "dd: drift, l = 0.5\n"
+    "mid: marker\n"
+    "scr: monitor"
+)
+RANGED_LINE = "dd, qf, dd, mid, qd, dd, scr, qf, dd"
+
+
+def test_track_start_reproduces_the_full_lattice_downstream(tao_with_beam):
+    """Starting from Tao's bunch at MID must reach the same END as tracking it all."""
+    from lume_impactx import ImpactXSimulator
+
+    tao = tao_with_beam(RANGED, RANGED_LINE)
+    partial = ImpactXSimulator.from_tao(tao, nslice=8, track_start="MID")
+    full = ImpactXSimulator.from_tao(tao, nslice=8)
+
+    assert len(partial.lattice) < len(full.lattice)
+    reference = tao.particles("END")
+    for key in ("sigma_x", "sigma_y", "norm_emit_x", "mean_energy"):
+        assert partial.final_particles[key] == pytest.approx(reference[key], rel=1e-6)
+
+
+def test_track_end_is_inclusive(tao_with_beam):
+    """`track_end` includes its element, as Tao does -- END means the whole lattice."""
+    from lume_impactx import ImpactXSimulator
+
+    tao = tao_with_beam(RANGED, RANGED_LINE)
+    simulator = ImpactXSimulator.from_tao(
+        tao, nslice=8, track_start="MID", track_end="SCR"
+    )
+    reference = tao.particles("SCR")
+    for key in ("sigma_x", "sigma_y", "norm_emit_x"):
+        assert simulator.final_particles[key] == pytest.approx(reference[key], rel=1e-6)
+
+
+def test_a_range_restricts_the_capture_points(tao_with_beam):
+    """Otherwise capture_at names elements that were never translated, and every one of
+    them warns after the run."""
+    from lume_impactx import ImpactXSimulator
+
+    tao = tao_with_beam(RANGED, RANGED_LINE)
+    full = ImpactXSimulator.from_tao(tao, nslice=8)
+    ranged = ImpactXSimulator.from_tao(
+        tao, nslice=8, track_start="MID", track_end="SCR"
+    )
+    assert {"BEGINNING", "MID", "SCR", "END"} <= set(full.capture_at)
+    assert ranged.capture_at == ["SCR"]
+
+
+def test_track_start_also_moves_where_the_beam_comes_from(tao_with_beam):
+    """One argument moves the lattice and the beam together, so they cannot disagree."""
+    from lume_impactx import ImpactXSimulator
+
+    tao = tao_with_beam(RANGED, RANGED_LINE)
+    simulator = ImpactXSimulator.from_tao(tao, nslice=8, track_start="MID")
+    assert simulator.initial_particles["sigma_x"] == pytest.approx(
+        tao.particles("MID")["sigma_x"], rel=1e-9
+    )
+
+
+def test_a_bad_range_says_why(tao_with_beam):
+    from lume_impactx import ImpactXSimulator
+
+    tao = tao_with_beam(RANGED, RANGED_LINE)
+    with pytest.raises(ValueError, match="not an element"):
+        ImpactXSimulator.from_tao(tao, nslice=8, track_start="NOWHERE")
+    with pytest.raises(ValueError, match="nothing to track"):
+        ImpactXSimulator.from_tao(tao, nslice=8, track_start="SCR", track_end="MID")

@@ -26,6 +26,7 @@ from typing import Any
 
 import numpy as np
 from lume.actions import ReadOnlyActionMixin, WritableActionMixin
+from lume.exceptions import ReadOnlyError
 from lume.variables import (
     BoolVariable,
     EnumVariable,
@@ -59,6 +60,7 @@ __all__ = [
     "RunInfoAction",
     "OpticsAction",
     "ParticleGroupAction",
+    "_ElementByNameMixin",
 ]
 
 
@@ -364,3 +366,137 @@ class ParticleGroupAction(WritableActionMixin[ImpactXSimulator], ParticleGroupVa
 
     def _set(self, simulator: Any, value: Any) -> None:
         _check(simulator).initial_particles = value
+
+
+# --------------------------------------------------------------------------------------
+# Addressing by name
+#
+# The generated variables above address elements by lattice *index*, which is right for
+# config.py: it walks the lattice, so the index is known and authoritative, and a shifted
+# index is caught rather than silently reading the wrong magnet.
+#
+# Hand-written variables are the other case. A virtual accelerator knows "QF01", not
+# "index 37", and its conversion logic -- kG to k1 through the magnetic rigidity, say --
+# belongs in the facility's own repository, not here. These are the bases it subclasses,
+# shaped like lume-cheetah's so code written against that contract ports across:
+#
+#     class QuadrupoleBCTRL(ImpactXWritableScalarVariable):
+#         unit: str = "kG"
+#         def _get(self, simulator):
+#             element, energy = self._resolve_element_and_energy(simulator, self.element_name)
+#             return element.k * element.ds * 33.356 * energy / 1e9
+# --------------------------------------------------------------------------------------
+
+
+class _ElementByNameMixin:
+    """Resolve an element by name, and the reference energy where it sits.
+
+    ImpactX element names are not unique -- a lattice may use one element twice, and
+    :func:`~lume_impactx.interfaces.bmad.lattice_from_tao` splits a single Bmad element
+    into several -- so repeats are addressed as ``NAME##2``, ``NAME##3`` in beam order,
+    the convention :attr:`~lume_impactx.simulator.ImpactXSimulator.ele` and the captured
+    bunches share. Lookup folds case, because Tao returns names upper case.
+
+    No lattice-shape check is needed here, unlike :class:`_ElementAccessMixin`: a name
+    still finds its element after the lattice is edited, which is the whole point of
+    addressing this way.
+    """
+
+    element_name: str
+
+    @staticmethod
+    def _resolve_element_and_energy(simulator: Any, element_name: str):
+        """The element and the reference total energy in eV at it.
+
+        Returns both because almost every engineering-unit conversion needs the second:
+        a quadrupole's kG is its gradient times the magnetic rigidity, which is set by
+        the reference momentum *at that element* -- and that differs either side of an
+        accelerating cavity. The signature matches lume-cheetah's
+        ``_resolve_element_and_energy`` deliberately.
+        """
+        sim = _check(simulator)
+        element = sim.ele[element_name]
+        try:
+            energy = sim.reference_energy_at(element_name)
+        except KeyError:  # pragma: no cover - ele[] would already have raised
+            energy = None
+        return element, energy
+
+    def _element(self, simulator: Any):
+        element, _ = self._resolve_element_and_energy(simulator, self.element_name)
+        return element
+
+
+class ImpactXWritableActionMixin(
+    _ElementByNameMixin, WritableActionMixin[ImpactXSimulator]
+):
+    """Read and write one attribute of a named element.
+
+    Subclasses that need a unit conversion override ``_get``/``_set``; those that just
+    want the raw attribute set :attr:`attribute` and inherit these.
+    """
+
+    #: Attribute to read and write. Subclasses overriding _get/_set may leave it unset.
+    attribute: str = ""
+
+    def _get(self, simulator: Any) -> Any:
+        return getattr(self._element(simulator), self.attribute)
+
+    def _set(self, simulator: Any, value: Any) -> None:
+        setattr(self._element(simulator), self.attribute, value)
+
+
+class ImpactXReadOnlyActionMixin(
+    ImpactXWritableActionMixin, ReadOnlyActionMixin[ImpactXSimulator]
+):
+    """A readback: the same ``_get`` as its writable counterpart, and no ``_set``.
+
+    Inheriting from the writable mixin is what lets a facility write ``BACT`` as a
+    one-line subclass of its ``BCTRL``, reusing the conversion rather than repeating it.
+    """
+
+    read_only: bool = True
+
+    def _set(self, simulator: Any, value: Any) -> None:
+        raise ReadOnlyError(f"{self.name} is read-only.")
+
+
+class ImpactXWritableScalarVariable(ImpactXWritableActionMixin, ScalarVariable):
+    """A writable float on a named element."""
+
+
+class ImpactXReadOnlyScalarVariable(ImpactXReadOnlyActionMixin, ScalarVariable):
+    """A read-only float on a named element."""
+
+
+class ImpactXWritableIntVariable(ImpactXWritableActionMixin, IntVariable):
+    """A writable integer on a named element, e.g. ``nslice``."""
+
+
+class ImpactXWritableNDVariable(ImpactXWritableActionMixin, NDVariable):
+    """A writable array on a named element, e.g. ``k_normal``."""
+
+
+class ImpactXReadOnlyNDVariable(ImpactXReadOnlyActionMixin, NDVariable):
+    """A read-only array derived from a named element."""
+
+
+class ImpactXReadOnlyEnumVariable(ImpactXReadOnlyActionMixin, EnumVariable):
+    """A read-only enumerated readback, e.g. a control state."""
+
+
+class ImpactXBunchAtElementVariable(
+    ReadOnlyActionMixin[ImpactXSimulator], ParticleGroupVariable
+):
+    """The captured bunch at a named element.
+
+    The element must be in the simulator's
+    :attr:`~lume_impactx.simulator.ImpactXSimulator.capture_at`, or there is nothing to
+    return; :meth:`~lume_impactx.simulator.ImpactXSimulator.from_tao` fills that in from
+    the Bmad markers and monitors. This is the variable a screen image is built from.
+    """
+
+    element_name: str
+
+    def _get(self, simulator: Any) -> Any:
+        return _check(simulator).particles[self.element_name]

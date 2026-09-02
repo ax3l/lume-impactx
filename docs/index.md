@@ -54,6 +54,8 @@ through the LUME model interface, so an ImpactX lattice can be driven by the sam
 | `sim.ele["QF"]` | Lattice elements by name, case-insensitively; repeats as `QF##2`. Writes reach the lattice. |
 | `sim["GROUP"]["k"] = 1.2` | Named element groups written as one, for composite devices. |
 | `sim.reference_energy_at` / `sim.energies` | Reference energy at each element, for magnet-setting conversions across a cavity. |
+| `from_tao(track_start=…, track_end=…)` | Model only part of a lattice, from Tao's bunch at that point. |
+| `ImpactXWritableScalarVariable` & co. | Name-keyed action bases a facility subclasses for its own PVs. |
 
 ## Installation
 
