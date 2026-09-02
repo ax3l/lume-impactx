@@ -365,12 +365,23 @@ def test_sim_variables_track_the_settings_actually_carried(fodo_lattice, waterba
         return simulator, names
 
     simulator, default_names = sim_variables()
-    assert default_names == {
-        f"sim:{k}"
-        for k in simulator.settings
-        if k in {"space_charge", "diagnostics", "slice_step_diagnostics", "periods"}
-    }
-    assert "sim:csr" not in default_names
+    # Every physics toggle is carried by default -- AMReX's ParmParse is global, so
+    # leaving one unset inherits the previous simulation's choice -- and each carried
+    # setting gets a variable.
+    assert {
+        "sim:csr",
+        "sim:isr",
+        "sim:spin",
+        "sim:space_charge",
+        "sim:diagnostics",
+        "sim:periods",
+    } <= default_names
+
+    # But a setting the simulator does not carry generates nothing. Variables were once
+    # emitted for settings with no value behind them, and reading one raised.
+    assert "sim:csr_bins" not in default_names
+    assert "sim:particle_shape" not in default_names
+    assert "sim:n_cell" not in default_names
 
     _, with_csr = sim_variables(csr=True, csr_bins=150, particle_shape=2)
     assert {"sim:csr", "sim:csr_bins", "sim:particle_shape"} <= with_csr

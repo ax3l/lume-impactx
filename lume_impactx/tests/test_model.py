@@ -577,3 +577,33 @@ def test_several_user_hooks_on_one_event_all_run(fodo_lattice, waterbag):
     simulator.track()
     assert calls.count(1) == len(fodo_lattice)
     assert calls.count(2) == len(fodo_lattice)
+
+
+def test_a_physics_toggle_does_not_leak_into_the_next_run(fodo_lattice, waterbag):
+    """AMReX's ParmParse is global and outlives an ImpactX instance.
+
+    Measured before this was fixed: a run with csr=True changed the *next* run's
+    sigma_x through a bend by 3.3e-3, and the run after that matched the CSR one rather
+    than the clean one before it. Anyone doing a CSR study and then a non-CSR
+    comparison in the same session would silently have got CSR in both.
+    """
+    from impactx import elements as impactx_elements
+
+    from lume_impactx.simulator import ImpactXSimulator
+
+    def bend_run(**settings):
+        simulator = ImpactXSimulator(
+            lattice=[
+                impactx_elements.ExactSbend(name="b", ds=0.5, phi=6.875, nslice=8)
+            ],
+            ref={"species": "electron", "kin_energy_MeV": KIN_ENERGY_MEV},
+            distribution=waterbag,
+            npart=500,
+            bunch_charge_C=BUNCH_CHARGE_C,
+            settings=settings or None,
+        )
+        return simulator.results["moments"]["sigma_x"]
+
+    clean = bend_run()
+    bend_run(csr=True, particle_shape=2)  # poisons the global parameter store
+    assert bend_run() == pytest.approx(clean, rel=1e-12)

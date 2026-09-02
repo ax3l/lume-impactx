@@ -71,6 +71,18 @@ _DEFAULT_SETTINGS: dict[str, Any] = {
     "diagnostics": False,
     "slice_step_diagnostics": False,
     "space_charge": False,
+    # Every physics toggle is set explicitly, because AMReX's ParmParse is *global* and
+    # outlives an ImpactX instance: leaving one unset inherits whatever the last
+    # simulation in this process chose. Measured -- a run with csr=True changed the next
+    # run's sigma_x through a bend by 3.3e-3, and the run after that was identical to
+    # the CSR one rather than to the clean one before it. Anyone doing a CSR study and
+    # then a non-CSR comparison in the same session would silently get CSR in both.
+    "csr": False,
+    "isr": False,
+    "isr_on_ref_part": False,
+    "spin": False,
+    "eigenemittances": False,
+    "space_charge_apply_longitudinal_kick": False,
     # Explicit so n_steps and the s-series variable shapes have a stated basis rather
     # than an implied one.
     "periods": 1,

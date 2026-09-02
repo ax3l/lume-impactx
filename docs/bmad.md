@@ -255,6 +255,34 @@ with markers and warn instead:
 lattice = lattice_from_tao(tao, nslice=10, skip_unsupported=True)
 ```
 
+## An independent third opinion
+
+Every other comparison here is against Bmad. That is the right reference, but it is a
+single one: a shared misreading of a Bmad convention would look like agreement. So
+`lume_impactx/tests/test_impactz.py` tracks the same bunch through **three** codes —
+Bmad, Impact-Z via lume-impact, and ImpactX via this translator — where the two
+translators share no implementation.
+
+| case | Bmad ↔ ImpactX | Bmad ↔ Impact-Z |
+| --- | --- | --- |
+| drift | 1.0e-15 | 2.0e-16 |
+| quadrupole | 1.9e-14 | 1.7e-14 |
+| **sbend** | **4.3e-11** | 1.2e-7 |
+| four FODO cells | 3.2e-14 | 1.0e-13 |
+
+The bend is the interesting row: this translation lands about 2800× closer to Bmad than
+the sibling package's does, which is an independent check that the exact-sector-bend and
+nonlinear-`DipEdge` work was worth doing.
+
+It needs a toolchain the other tests do not, all of it on conda-forge, and skips when
+any of it is missing:
+
+```bash
+micromamba create -n lume-impactx-z -c conda-forge python=3.12 impactx bmad pytao \
+    impact-z distgen pytest
+pip install lume-impact
+```
+
 ## Species
 
 The species comes from the **lattice** — what Bmad actually tracked, and what every
