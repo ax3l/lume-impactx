@@ -322,3 +322,128 @@ def test_cumulative_maps_run_from_the_lattice_start(waterbag):
 
     # the first drift, read off the cumulative map at s = 0.4
     np.testing.assert_allclose(maps[1][:2, :2], [[1.0, 0.4], [0.0, 1.0]], atol=1e-12)
+
+
+from lume_impactx.tests.conftest import BUNCH_CHARGE_C, KIN_ENERGY_MEV  # noqa: E402
+
+
+# -- the addressing surface a virtual accelerator needs --------------------------------
+#
+# SLAC's virtual-accelerator addresses elements by *name* across all three of its
+# backends -- impact.ele[name], getattr(cheetah.segment, name), bmad's
+# ele_gen_attribs(name) -- and drives composite devices through simulator[group][key].
+# ImpactX names are not unique, so these carry the same ##2/##3 disambiguation the
+# captured bunches use.
+
+
+def test_elements_are_addressable_by_name(fodo_simulator):
+    elements = fodo_simulator.ele
+    assert elements["quad1"].k == pytest.approx(1.0)
+    assert elements["quad2"].k == pytest.approx(-1.0)
+    # Bmad hands names back upper case; lookup folds it.
+    assert elements["QUAD1"].k == pytest.approx(1.0)
+    # Live elements, so a write reaches the lattice the next track uses.
+    elements["quad1"].k = 1.5
+    assert fodo_simulator.lattice[1].k == pytest.approx(1.5)
+
+
+def test_repeated_element_names_are_disambiguated(fodo_lattice, waterbag):
+    """A lattice may use one element twice, and lattice_from_tao splits a single Bmad
+    element into several. Names alone cannot address those."""
+    from impactx import elements as impactx_elements
+
+    from lume_impactx.simulator import ImpactXSimulator
+
+    lattice = fodo_lattice + [impactx_elements.Quad(name="quad1", ds=1.0, k=2.0)]
+    simulator = ImpactXSimulator(
+        lattice=lattice,
+        ref={"species": "electron", "kin_energy_MeV": KIN_ENERGY_MEV},
+        distribution=waterbag,
+        npart=200,
+        bunch_charge_C=BUNCH_CHARGE_C,
+        track_on_init=False,
+    )
+    assert simulator.ele["quad1"].k == pytest.approx(1.0)
+    assert simulator.ele["quad1##2"].k == pytest.approx(2.0)
+    assert len(simulator.ele.all_named("quad1")) == 2
+
+
+def test_an_unknown_element_name_lists_what_there_is(fodo_simulator):
+    with pytest.raises(KeyError, match="quad1"):
+        fodo_simulator.ele["nowhere"]
+
+
+def test_a_group_writes_every_member(fodo_simulator):
+    """simulator[group][key] = value, the shape lume-impact's control groups have."""
+    fodo_simulator.groups = {"QUADS": ["quad1", "quad2"]}
+    group = fodo_simulator["QUADS"]
+    assert len(group) == 2
+    assert group["k"] == pytest.approx(1.0)  # reads the first member
+
+    group["k"] = 3.0
+    assert fodo_simulator.ele["quad1"].k == pytest.approx(3.0)
+    assert fodo_simulator.ele["quad2"].k == pytest.approx(3.0)
+
+
+def test_a_group_says_so_when_an_attribute_is_wrong(fodo_simulator):
+    fodo_simulator.groups = {"MIXED": ["quad1", "drift1"]}
+    with pytest.raises(KeyError, match="has no attribute"):
+        fodo_simulator["MIXED"]["k"] = 1.0
+
+
+def test_a_bare_subscript_means_a_group_and_says_so(fodo_simulator):
+    """Narrower than lume-impact's Impact.__getitem__, which also resolves elements,
+    header keys, end_ stats and particles: paths. One meaning, and the error points at
+    the other two accessors."""
+    with pytest.raises(KeyError) as caught:
+        fodo_simulator["quad1"]
+    assert ".ele[name]" in str(caught.value)
+    assert ".particles[name]" in str(caught.value)
+
+
+def test_particles_can_be_called_as_well_as_subscripted(fodo_simulator):
+    """lume-impact subscripts, lume-bmad calls. Both work."""
+    assert (
+        fodo_simulator.particles("final")["sigma_x"]
+        == fodo_simulator.particles["final"]["sigma_x"]
+    )
+
+
+def test_reference_energy_is_reported_per_element(fodo_simulator):
+    """Anything converting a magnet setting to kG needs the rigidity at that element."""
+    total_eV = (KIN_ENERGY_MEV + 0.51099895069) * 1e6
+    for name in ("quad1", "quad2"):
+        assert fodo_simulator.reference_energy_at(name) == pytest.approx(
+            total_eV, rel=1e-9
+        )
+    assert set(fodo_simulator.energies) == set(fodo_simulator.ele)
+
+
+def test_reference_energy_follows_an_accelerating_cavity(fodo_lattice, waterbag):
+    """A ShortRF moves ImpactX's reference, so two quads with the same name on either
+    side of one are at different energies. Replayed analytically -- ShortRF.H:207 does
+    pt -= V*cos(phase) with pt = -gamma -- so no run is needed."""
+    from impactx import elements as impactx_elements
+
+    from lume_impactx.simulator import ImpactXSimulator
+
+    mass_eV = 0.51099895069e6
+    gain_eV = 20.0e6
+    lattice = [
+        impactx_elements.Quad(name="q", ds=0.1, k=1.0, nslice=1),
+        impactx_elements.ShortRF(
+            name="cav", V=gain_eV / mass_eV, freq=1.3e9, phase=0.0
+        ),
+        impactx_elements.Quad(name="q", ds=0.1, k=1.0, nslice=1),
+    ]
+    simulator = ImpactXSimulator(
+        lattice=lattice,
+        ref={"species": "electron", "kin_energy_MeV": KIN_ENERGY_MEV},
+        distribution=waterbag,
+        npart=200,
+        bunch_charge_C=BUNCH_CHARGE_C,
+        track_on_init=False,
+    )
+    before = simulator.reference_energy_at("q")
+    after = simulator.reference_energy_at("q##2")
+    assert after - before == pytest.approx(gain_eV, rel=1e-9)

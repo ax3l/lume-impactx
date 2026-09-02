@@ -36,6 +36,7 @@ arranges that at import time.
 from __future__ import annotations
 
 import copy
+import math
 import logging
 import warnings
 from collections.abc import Mapping
@@ -138,8 +139,113 @@ class ParticleGroups(Mapping):
     def __len__(self) -> int:
         return len(self._entries)
 
+    def __call__(self, key: str) -> ParticleGroup:
+        """``particles("END")``, the spelling lume-bmad uses.
+
+        lume-impact subscripts (``particles["END"]``) and lume-bmad calls. Both reach
+        the same bunch here, so code written against either reads naturally.
+        """
+        return self[key]
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}({sorted(self._entries)})"
+
+
+class ElementGroup:
+    """A named set of lattice elements written as one.
+
+    ``simulator["Q1_Q2"]["k"] = 1.2`` sets ``k`` on every member, which is how
+    lume-impact's control groups behave and what the SLAC virtual accelerator's
+    ``ImpactGroupVariable`` drives. Reading returns the first member's value.
+    """
+
+    def __init__(self, name: str, elements: list[Any]) -> None:
+        self.name = name
+        self.elements = elements
+
+    def __getitem__(self, attribute: str) -> Any:
+        if not self.elements:
+            raise KeyError(f"Group {self.name!r} has no elements.")
+        try:
+            return getattr(self.elements[0], attribute)
+        except AttributeError as exc:
+            raise KeyError(
+                f"Group {self.name!r} elements have no attribute {attribute!r}."
+            ) from exc
+
+    def __setitem__(self, attribute: str, value: Any) -> None:
+        for element in self.elements:
+            if not hasattr(element, attribute):
+                raise KeyError(
+                    f"Group {self.name!r}: {type(element).__name__} "
+                    f"{getattr(element, 'name', '?')!r} has no attribute "
+                    f"{attribute!r}."
+                )
+            setattr(element, attribute, value)
+
+    def __len__(self) -> int:
+        return len(self.elements)
+
+    def __repr__(self) -> str:
+        return f"ElementGroup({self.name!r}, {len(self.elements)} elements)"
+
+
+class ElementsByName(Mapping):
+    """Lattice elements looked up by name, case-insensitively.
+
+    ImpactX element names are not unique -- a lattice may use one element twice, and
+    :func:`~lume_impactx.interfaces.bmad.lattice_from_tao` splits a single Bmad element
+    into several -- so repeats are disambiguated in beam order as ``NAME``, ``NAME##2``,
+    ``NAME##3``, the same convention
+    :attr:`~lume_impactx.simulator.ImpactXSimulator.particles` uses for captures.
+
+    Values are the live ImpactX elements, so ``sim.ele["QF"].k = 1.2`` writes through
+    to the lattice. That is attribute access, where lume-impact's ``impact.ele[name]``
+    is a dict -- ImpactX elements are pybind objects, not dicts.
+    """
+
+    def __init__(self, lattice: list) -> None:
+        self._entries: dict[str, Any] = {}
+        counts: dict[str, int] = {}
+        for element in lattice:
+            name = str(getattr(element, "name", "") or "")
+            if not name:
+                continue
+            counts[name] = counts.get(name, 0) + 1
+            label = name if counts[name] == 1 else f"{name}##{counts[name]}"
+            self._entries[label] = element
+        self._index = {key.lower(): key for key in self._entries}
+
+    def __getitem__(self, key: str) -> Any:
+        actual = self._index.get(str(key).lower())
+        if actual is None:
+            raise KeyError(
+                f"No element named {key!r}. Available: {sorted(self._entries)[:20]}"
+                f"{' ...' if len(self._entries) > 20 else ''}"
+            )
+        return self._entries[actual]
+
+    def __iter__(self):
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def all_named(self, name: str) -> list[Any]:
+        """Every element sharing a name, in beam order.
+
+        ``sim.ele.all_named("QF")`` returns the repeats that ``sim.ele["QF"]`` and
+        ``sim.ele["QF##2"]`` address one at a time.
+        """
+        wanted = str(name).lower()
+        return [
+            element
+            for label, element in self._entries.items()
+            if label.lower().split("##")[0] == wanted
+        ]
+
+    def __repr__(self) -> str:
+        return f"ElementsByName({len(self._entries)} elements)"
 
 
 class ImpactXSimulator:
@@ -181,6 +287,11 @@ class ImpactXSimulator:
         that name. Uses ImpactX's ``sim.hook["after_element"]`` -- the mechanism its
         documentation prescribes for in-situ analysis -- so the lattice itself is not
         modified. :meth:`from_tao` fills this in from the Bmad markers and monitors.
+    groups : dict, optional
+        Named sets of element names written as one, e.g.
+        ``{"QUADS": ["QF", "QD"]}``. ``simulator["QUADS"]["k"] = 1.2`` then sets ``k``
+        on both. This is the shape lume-impact's control groups have, and what the SLAC
+        virtual accelerator's group PVs drive.
     track_on_init : bool
         Track once during construction so results are available immediately. Keep this
         True: a ``LUMEModel`` must be able to answer ``get()`` before any ``set()``.
@@ -203,6 +314,7 @@ class ImpactXSimulator:
         ref_origin: ImpactXRefPart | None = None,
         settings: dict[str, Any] | None = None,
         capture_at: list[str] | None = None,
+        groups: dict[str, list[str]] | None = None,
         track_on_init: bool = True,
     ) -> None:
         if (distribution is None) == (initial_particles is None):
@@ -222,6 +334,7 @@ class ImpactXSimulator:
         self.bunch_charge_C = bunch_charge_C
         self.initial_particles = initial_particles
         self.capture_at = list(capture_at or [])
+        self.groups: dict[str, list[str]] = dict(groups or {})
         self.ref_origin = ref_origin
         self.settings = {**_DEFAULT_SETTINGS, **(settings or {})}
 
@@ -541,6 +654,97 @@ class ImpactXSimulator:
         ``track_particles``.
         """
         return self.track()
+
+    @property
+    def ele(self) -> ElementsByName:
+        """Lattice elements by name, so ``sim.ele["QF"].k = 1.2`` writes through.
+
+        Built fresh on each access, because the lattice is a plain list the caller may
+        have edited. Repeats disambiguate as ``QF``, ``QF##2``; ``sim.ele.all_named``
+        gives them together.
+        """
+        return ElementsByName(self.lattice)
+
+    def __getitem__(self, key: str) -> ElementGroup:
+        """A named element group, for writing several elements as one.
+
+        Only groups: single elements are :attr:`ele`, and bunches are
+        :attr:`particles`, so a bare subscript has exactly one meaning here. That is a
+        deliberate narrowing of lume-impact, whose ``Impact.__getitem__`` also resolves
+        elements, ``header:`` keys, ``end_`` stats and ``particles:`` paths.
+        """
+        if key in self.groups:
+            elements = [
+                element
+                for name in self.groups[key]
+                for element in ElementsByName(self.lattice).all_named(name)
+            ]
+            return ElementGroup(key, elements)
+        raise KeyError(
+            f"No group named {key!r}. Groups: {sorted(self.groups)}. For a single "
+            "element use .ele[name]; for a bunch use .particles[name]."
+        )
+
+    def reference_energy_at(self, name: str) -> float:
+        """Reference kinetic energy in eV at the exit of a named element.
+
+        Needed by anything converting a magnet setting to or from an engineering unit:
+        a quadrupole's kG comes from the gradient times the magnetic rigidity, which is
+        set by the reference momentum *at that element*. lume-cheetah exposes the same
+        thing as ``simulator.energies[name]``.
+
+        The reference only moves where an element accelerates it, so this replays the
+        lattice's ``ShortRF`` elements analytically -- ``ShortRF.H:207`` does
+        ``pt -= V*cos(phase)`` with ``pt = -gamma`` -- rather than requiring a run.
+
+        Returns
+        -------
+        float
+            Total energy in eV at that element's exit.
+        """
+        mass_eV = float(self.ref.get("mass_MeV", 0.0)) * 1.0e6
+        if not mass_eV:
+            try:
+                from beamphysics.species import mass_of
+            except ImportError:  # pragma: no cover
+                from pmd_beamphysics.species import mass_of
+
+            mass_eV = mass_of(str(self.ref.get("species", "electron")))
+        gamma = 1.0 + float(self.ref["kin_energy_MeV"]) * 1.0e6 / mass_eV
+
+        # Labels are built exactly as ElementsByName builds them, so "QF##2" resolves
+        # to the second QF -- which matters here, because the two can sit on opposite
+        # sides of a cavity and have different energies.
+        target = str(name).lower()
+        counts: dict[str, int] = {}
+        for element in self.lattice:
+            if type(element).__name__ == "ShortRF":
+                values = element.to_dict()
+                gamma += values["V"] * math.cos(math.radians(values["phase"]))
+            element_name = str(getattr(element, "name", "") or "")
+            if not element_name:
+                continue
+            counts[element_name] = counts.get(element_name, 0) + 1
+            label = (
+                element_name
+                if counts[element_name] == 1
+                else f"{element_name}##{counts[element_name]}"
+            )
+            if label.lower() == target:
+                return gamma * mass_eV
+        raise KeyError(
+            f"No element named {name!r} in the lattice. Repeats are labelled "
+            "NAME##2, NAME##3, as in .ele"
+        )
+
+    @property
+    def energies(self) -> dict[str, float]:
+        """Reference total energy in eV at each named element's exit.
+
+        The lume-cheetah spelling, for code written against that contract. Repeated
+        names disambiguate as in :attr:`ele`.
+        """
+        return {name: self.reference_energy_at(name) for name in self.ele}
 
     @property
     def particles(self) -> ParticleGroups:
