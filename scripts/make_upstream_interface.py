@@ -28,7 +28,7 @@ TARGET = ROOT / "upstream" / "impactx.py"
 
 HEADER = '''"""ImpactX beam data <-> ParticleGroup.
 
-`ImpactX <https://impactx.readthedocs.io>`_ is an s-based beam dynamics code, the
+[ImpactX](https://impactx.readthedocs.io) is an s-based beam dynamics code, the
 successor of IMPACT-Z. Its particles are held at a common ``s`` with a spread in
 arrival time, which is z-coordinates on this side -- all ``z`` equal, ``t`` varying --
 so the conversion is a direct algebraic map, like the Bmad interface and unlike the
@@ -57,12 +57,13 @@ ImpactX describes each particle at fixed ``s`` by ``(x, y, t, px, py, pt)``:
   is what openPMD's ``position/t + positionOffset/t`` means in ImpactX output, and it
   keeps quantities like `ParticleGroup.average_current` meaningful.
 
-Originally developed in `lume-impactx <https://github.com/lume-science/lume-impactx>`_.
+Originally developed in lume-impactx.
 """
 
 from __future__ import annotations
 
 import pathlib
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -94,6 +95,7 @@ def render() -> str:
 
     exports = [
         "ImpactXRefPart",
+        "PARTICLE_STATUS_LOST",
         "UnrepresentableParticleData",
         "beam_monitor_iterations",
         "impactx_to_particlegroup_data",

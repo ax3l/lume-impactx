@@ -52,6 +52,7 @@ def _load_generated():
 
 EXPECTED_EXPORTS = {
     "ImpactXRefPart",
+    "PARTICLE_STATUS_LOST",
     "UnrepresentableParticleData",
     "particle_id_from_idcpu",
     "beam_monitor_iterations",

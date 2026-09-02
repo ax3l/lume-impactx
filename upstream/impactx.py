@@ -1,6 +1,6 @@
 """ImpactX beam data <-> ParticleGroup.
 
-`ImpactX <https://impactx.readthedocs.io>`_ is an s-based beam dynamics code, the
+[ImpactX](https://impactx.readthedocs.io) is an s-based beam dynamics code, the
 successor of IMPACT-Z. Its particles are held at a common ``s`` with a spread in
 arrival time, which is z-coordinates on this side -- all ``z`` equal, ``t`` varying --
 so the conversion is a direct algebraic map, like the Bmad interface and unlike the
@@ -29,12 +29,13 @@ ImpactX describes each particle at fixed ``s`` by ``(x, y, t, px, py, pt)``:
   is what openPMD's ``position/t + positionOffset/t`` means in ImpactX output, and it
   keeps quantities like `ParticleGroup.average_current` meaningful.
 
-Originally developed in `lume-impactx <https://github.com/lume-science/lume-impactx>`_.
+Originally developed in lume-impactx.
 """
 
 from __future__ import annotations
 
 import pathlib
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -48,6 +49,7 @@ from ..units import c_light
 
 __all__ = [
     "ImpactXRefPart",
+    "PARTICLE_STATUS_LOST",
     "UnrepresentableParticleData",
     "beam_monitor_iterations",
     "impactx_to_particlegroup_data",
@@ -210,6 +212,47 @@ def pmd_species_of(ref: ImpactXRefPart, rtol: float = 1e-6) -> str:
     )
 
 
+def _check_species_matches_reference(
+    species: str, ref: ImpactXRefPart, rtol: float = 1e-6
+) -> None:
+    """Refuse a species that is not the one the reference particle describes.
+
+    The momenta are un-normalized with the *reference* mass, and ``ParticleGroup`` then
+    reads them back with the *species* mass. If the two disagree nothing raises on its
+    own: the bunch is silently relabelled and comes back at the wrong energy -- a 2 GeV
+    electron beam read as protons reports gamma = 2.35.
+
+    Parameters
+    ----------
+    species : str
+        openPMD-beamphysics species name.
+    ref : ImpactXRefPart
+        The reference particle the coordinates are relative to.
+    rtol : float
+        Relative tolerance. ImpactX and openPMD-beamphysics carry electron masses that
+        differ in the 9th digit, so this cannot be exact.
+
+    Raises
+    ------
+    ValueError
+        If the species' rest mass or charge does not match the reference particle's.
+    """
+    # named for the reference particle, not just "matches": lume-impactx, which shares
+    # this module verbatim, has its own _check_species_matches(pg, ref) for injection
+    mass_matches = np.isclose(mass_of(species), ref.mass_eV, rtol=rtol)
+    charge_matches = np.isclose(charge_of(species) / e_charge, ref.charge_qe, rtol=rtol)
+    if mass_matches and charge_matches:
+        return
+    raise ValueError(
+        f"species={species!r} (mass {mass_of(species):.6e} eV, charge "
+        f"{charge_of(species) / e_charge:+.3f} e) is not the species the reference "
+        f"particle describes (mass {ref.mass_eV:.6e} eV, charge {ref.charge_qe:+.3f} "
+        "e). The momenta are normalized by the reference mass, so relabelling alone "
+        "would return the bunch at the wrong energy. Pass species= only to name a "
+        "species that pmd_species_of() cannot infer, not to convert between species."
+    )
+
+
 # --------------------------------------------------------------------------------------
 # Coordinate conversion
 # --------------------------------------------------------------------------------------
@@ -222,11 +265,18 @@ def particlegroup_to_impactx(pg: ParticleGroup, ref: ImpactXRefPart) -> dict:
     ----------
     pg : ParticleGroup
         The bunch to convert. Unless it already sits exactly on one plane it is copied
-        and drifted to its own mean ``z``, so the input is never mutated. Note that
-        ``pg.z`` itself does not enter the result: in the local frame the plane *is*
-        the reference particle's location. ``pg.status`` is not carried either --
-        ImpactX has no equivalent -- so filter dead particles beforehand if that
-        matters.
+        and drifted to its own mean ``z``, so the input is never mutated.
+
+        ``pg.x`` and ``pg.y`` are taken to be *already relative to the reference
+        particle*, which is the frame the reader returns and the frame ImpactX works
+        in; ``ref.x`` and ``ref.y`` are not subtracted. A lab-frame bunch around a
+        reference orbit that is off-axis must be shifted first. ``pg.z`` does not enter
+        the result at all: in the local frame the plane *is* the reference particle's
+        location.
+
+        ``pg.status`` and ``pg.id`` are not carried -- ImpactX has no equivalent of the
+        first, and ``add_n_particles`` assigns its own ids -- so filter dead particles
+        beforehand if that matters.
     ref : ImpactXRefPart
         The reference particle the ImpactX coordinates are relative to.
 
@@ -235,8 +285,14 @@ def particlegroup_to_impactx(pg: ParticleGroup, ref: ImpactXRefPart) -> dict:
     dict
         Keys ``position_x``, ``position_y``, ``position_t``, ``momentum_x``,
         ``momentum_y``, ``momentum_t`` (arrays), ``weighting`` (array, real particles
-        per macroparticle), ``qm`` (scalar, 1/eV) and ``species`` (str). These map
-        one-to-one onto ``ImpactXParticleContainer.add_n_particles``.
+        per macroparticle), ``qm`` (scalar, 1/eV) and ``species`` (str) -- the names
+        ``ImpactXParticleContainer.to_df()`` uses, which is also what
+        :func:`impactx_to_particlegroup_data` reads back.
+
+        ``ImpactXParticleContainer.add_n_particles`` takes the same quantities under
+        shorter names and has no species argument, so feed it as
+        ``add_n_particles(x=data["position_x"], ..., px=data["momentum_x"], ...,
+        qm=data["qm"], w=data["weighting"])``.
     """
     # The bunch must occupy a single plane. A t-coordinate bunch (spread in z) is
     # drifted to its own mean z on a copy, so the input is never mutated.
@@ -318,6 +374,8 @@ def impactx_to_particlegroup_data(
 
     if species is None:
         species = pmd_species_of(ref)
+    else:
+        _check_species_matches_reference(species, ref)
 
     mass_eV = ref.mass_eV
     beta_gamma = ref.beta_gamma
@@ -472,25 +530,30 @@ _CONSUMED_RECORDS = frozenset(
 #: BeamMonitor is configured with ``particles=False`` (moments-only output).
 _EMPTY_PLACEHOLDER_RECORD = "empty"
 
+#: The runtime component ImpactX attaches to every particle in its ``particles_lost``
+#: output: the path length ``s`` at which the particle was lost.
+_S_LOST_COLUMN = "s_lost"
+
+#: ``status`` for a particle ImpactX has lost.
+#:
+#: `ParticleStatus` defines only ``CATHODE = 0`` and ``ALIVE = 1``; `ParticleGroup`
+#: counts ``status == 1`` as alive and everything else as dead, and each interface
+#: passes its own source code's value straight through -- `beamphysics.interfaces.bmad`
+#: hands Bmad's ``state`` over as ``status`` verbatim, loss codes and all. There is no
+#: universal "lost" value to reach for, so this is a choice.
+#:
+#: The one value it must not be is ``0``: that is a positive claim that the particle is
+#: sitting at the source, and `beamphysics.interfaces.astra` writes ``status == 0`` back
+#: out as Astra's ``-1``, "at the cathode". ``2`` is outside Bmad's loss-direction range
+#: and carries no such meaning -- it reads as simply "not alive".
+PARTICLE_STATUS_LOST = 2
+
 # AMReX packs a particle's identity into one uint64 ``idcpu``: bit 63 marks the
 # particle valid, bits 24-62 hold the id, bits 0-23 the originating MPI rank. The id
 # counter is per-rank, so the id on its own repeats across the ranks of a parallel run
 # -- only the packed value is globally unique, and that is what becomes the
 # ``ParticleGroup`` id.
 _AMREX_VALID_BIT = np.uint64(1) << np.uint64(63)
-
-#: ``status`` for a particle ImpactX has lost.
-#:
-#: openPMD-beamphysics defines only ``CATHODE = 0`` and ``ALIVE = 1``; ``ParticleGroup``
-#: counts ``status == 1`` as alive and everything else as dead, and each interface
-#: passes its *source code's* own code through -- Bmad its ``state`` (3..6 for the loss
-#: direction), Astra its loss codes. There is no generic "lost" value to use.
-#:
-#: So this is a choice, and the one value it must not be is ``0``: that is CATHODE, a
-#: positive claim that the particle is sitting at the source, and
-#: ``beamphysics.interfaces.astra`` writes ``status == 0`` back out as Astra's -1, "at
-#: the cathode". 2 is outside Bmad's loss range and reads as merely "not alive".
-PARTICLE_STATUS_LOST = 2
 
 
 def particle_id_from_idcpu(idcpu) -> tuple[np.ndarray, np.ndarray]:
@@ -670,22 +733,31 @@ def read_beam_monitor_data(
         file_ref = refpart_from_openpmd(beam)
         series.flush()
 
-        # openPMD stores values that must be multiplied by unitSI to reach the unit the
-        # record declares. ImpactX writes 1.0 throughout, so this is a no-op today.
-        data = {
-            key: np.asarray(chunk) * record_component.unit_SI
-            for key, (record_component, chunk) in components.items()
-        }
+        # openPMD stores values that must be multiplied by unitSI to reach the unit
+        # the record declares, and ImpactX writes 1.0 throughout. The positions are
+        # genuinely lengths, so the factor is applied. The momenta and the weighting
+        # are ImpactX' own dimensionless quantities -- normalized by the reference
+        # momentum, and a count of real particles -- so a factor other than 1 would
+        # mean the file no longer follows the convention decoded below. Refuse rather
+        # than scale them into silent nonsense.
+        data = {}
+        for key, (record_component, chunk) in components.items():
+            unit_si = record_component.unit_SI
+            if key.startswith("position_"):
+                data[key] = np.asarray(chunk) * unit_si
+            elif unit_si != 1.0:
+                raise ValueError(
+                    f"{key} in {str(path)!r} has unitSI={unit_si}, but this reader "
+                    "decodes ImpactX' dimensionless convention, in which the momenta "
+                    "are normalized by the reference momentum and the weighting "
+                    "counts real particles."
+                )
+            else:
+                data[key] = np.asarray(chunk)
         extras = {key: np.asarray(chunk) for key, chunk in extras.items()}
         ids, valid = particle_id_from_idcpu(idcpu)
     finally:
         series.close()
-
-    # Every particle in a particles_lost file is lost by construction, whatever AMReX'
-    # validity bit says -- they are valid *entries of that container*, so the bit reads
-    # True for all of them and the bunch would otherwise claim to be entirely alive.
-    # The zeroed reference particle is the reliable signature of that file.
-    from_lost_file = not _reference_is_physical(file_ref)
 
     if ref is None:
         ref = file_ref
@@ -701,14 +773,28 @@ def read_beam_monitor_data(
 
     if strict:
         _check_representable(extras)
+    else:
+        dropped = _unrepresentable_in(extras)
+        if dropped:
+            warnings.warn(
+                f"Dropping {' and '.join(dropped)} from {str(path)!r} iteration "
+                f"{iteration}: ParticleGroup cannot represent it.",
+                stacklevel=2,
+            )
 
     data["id"] = ids
-    if from_lost_file:
-        data["status"] = np.full(ids.shape, PARTICLE_STATUS_LOST)
-    else:
-        data["status"] = np.where(
-            valid, int(ParticleStatus.ALIVE), PARTICLE_STATUS_LOST
-        )
+    # AMReX' validity bit is not aliveness: ImpactX copies lost particles into a
+    # separate container and marks them valid *there*, so the bit is True for every
+    # particle in a particles_lost file and taking it at face value would report a
+    # bunch that is entirely alive.
+    #
+    # The s_lost runtime component identifies such a file: CollectLost always adds it.
+    # The zeroed reference particle is a second signature, but only because ImpactX
+    # fails to set one -- keyed on that alone, this would silently go back to reporting
+    # lost particles as alive the day ImpactX fixes it.
+    from_lost_file = _S_LOST_COLUMN in extras or not _reference_is_physical(file_ref)
+    alive = valid & (not from_lost_file)
+    data["status"] = np.where(alive, int(ParticleStatus.ALIVE), PARTICLE_STATUS_LOST)
 
     return impactx_to_particlegroup_data(data, ref, species=species)
 
@@ -746,8 +832,15 @@ def read_beam_monitor(
         Reference particle to interpret the coordinates against. Taken from the file
         when omitted, which is what you want for a BeamMonitor. ImpactX's
         ``particles_lost`` output carries a *zeroed* reference particle, so reading it
-        requires passing the one from the corresponding monitor iteration, e.g.
-        ``refpart_from_openpmd(series.iterations[n].particles["beam"])``.
+        requires passing one, e.g.
+        ``refpart_from_openpmd(series.iterations[n].particles["beam"])`` from the
+        monitor file.
+
+        Be aware that this is an approximation for lost particles: they were lost at
+        whatever ``s`` the file's own ``s_lost`` record says, not at the monitor's, so
+        they are un-normalized with the wrong reference momentum and given the wrong
+        reference time unless the two happen to coincide. It is exact only for
+        particles lost at the monitor.
 
     Returns
     -------
@@ -757,11 +850,9 @@ def read_beam_monitor(
         module docstring for the frame conventions.
 
         ``status`` follows openPMD-beamphysics, where ``1`` is alive and anything else
-        is not: ``pg.n_alive`` and ``pg.n_dead`` split on exactly that. Reading a
-        ``particles_lost`` file marks every particle :data:`PARTICLE_STATUS_LOST`,
-        because they are all lost by construction -- AMReX' validity bit is True for all
-        of them, since they are valid *entries of that container*, and taking it at face
-        value would report a bunch that is entirely alive.
+        is not -- ``pg.n_alive`` and ``pg.n_dead`` split on exactly that. Every particle
+        in a ``particles_lost`` file is marked :data:`PARTICLE_STATUS_LOST`, because
+        they are all lost by construction.
 
     Raises
     ------
@@ -771,7 +862,10 @@ def read_beam_monitor(
     UnrepresentableParticleData
         If ``strict`` and the monitor recorded spin or runtime components.
     ValueError
-        If neither ``ref`` nor the file provides a usable reference particle.
+        If neither ``ref`` nor the file provides a usable reference particle, or if a
+        record carries a ``unitSI`` this reader cannot honour.
+    ImportError
+        If the ``openpmd-api`` package is not installed.
 
     Examples
     --------
