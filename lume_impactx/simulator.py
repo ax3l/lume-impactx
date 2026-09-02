@@ -45,10 +45,10 @@ from typing import Any
 from lume_impactx._mpi import ensure_external_mpi
 from lume_impactx.elements import restore_lattice, snapshot_lattice
 from lume_impactx.utils import (
-    C_LIGHT,
     ImpactXRefPart,
     add_particlegroup,
     apply_species,
+    c_light,
     particle_container_to_particlegroup,
     refpart_snapshot,
 )
@@ -550,7 +550,7 @@ class ImpactXSimulator:
         if not particles.in_z_coordinates:
             particles = particles.copy()
             particles.drift_to_z()
-        ref.t = C_LIGHT * float(particles["mean_t"])
+        ref.t = c_light * float(particles["mean_t"])
 
     def track(self) -> dict[str, Any]:
         """Build, track and tear down a simulation, then cache the results.

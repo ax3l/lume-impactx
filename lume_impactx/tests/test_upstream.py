@@ -50,25 +50,25 @@ def _load_generated():
     return module
 
 
+EXPECTED_EXPORTS = {
+    "ImpactXRefPart",
+    "UnrepresentableParticleData",
+    "particle_id_from_idcpu",
+    "beam_monitor_iterations",
+    "impactx_to_particlegroup_data",
+    "particlegroup_to_impactx",
+    "pmd_species_of",
+    "read_beam_monitor",
+    "read_beam_monitor_data",
+    "refpart_from_openpmd",
+}
+
+
 def test_generated_module_imports_and_exports():
     module = _load_generated()
-    for name in [
-        "ImpactXRefPart",
-        "particlegroup_to_impactx",
-        "impactx_to_particlegroup_data",
-        "pmd_species_of",
-        "refpart_from_openpmd",
-        "read_beam_monitor",
-    ]:
+    for name in sorted(EXPECTED_EXPORTS):
         assert hasattr(module, name), name
-    assert set(module.__all__) == {
-        "ImpactXRefPart",
-        "particlegroup_to_impactx",
-        "impactx_to_particlegroup_data",
-        "pmd_species_of",
-        "refpart_from_openpmd",
-        "read_beam_monitor",
-    }
+    assert set(module.__all__) == EXPECTED_EXPORTS
 
 
 def test_generated_module_has_no_downstream_imports():
@@ -99,9 +99,13 @@ def test_generated_module_carries_the_refusal_guard():
     assert hasattr(module, "_check_representable")
     assert hasattr(module, "UnrepresentableParticleData")
 
-    module._check_representable({"position_x": np.zeros(4), "spin_x": np.zeros(4)})
+    # the helper is asked only about the columns beyond the ones the converters map,
+    # so an all-zero spin is the "nothing to lose" case
+    module._check_representable({"spin_x": np.zeros(4), "spin_y": np.zeros(4)})
     with pytest.raises(module.UnrepresentableParticleData, match="spin"):
         module._check_representable({"spin_z": np.ones(4)})
+    with pytest.raises(module.UnrepresentableParticleData, match="s_lost"):
+        module._check_representable({"s_lost": np.ones(4)})
 
 
 def test_generated_module_matches_lume_impactx(bunch, electron_ref):

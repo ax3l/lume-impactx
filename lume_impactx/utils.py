@@ -43,14 +43,31 @@ It does refuse to drop them quietly. :func:`particle_container_to_particlegroup`
 :func:`read_beam_monitor` raise when a bunch actually carries such data, rather than
 returning a silently zeroed bunch that would look plausible and be wrong. Spin *moments*
 are unaffected -- they are ordinary scalars and flow through as variables.
+:func:`read_beam_monitor` takes ``strict=False`` to drop the extra data deliberately,
+which is what reading ImpactX' ``particles_lost`` output needs: it always carries a
+runtime ``s_lost`` component.
+
+Particle ids
+------------
+ImpactX stores AMReX' packed ``idcpu`` -- a validity bit, the id, and the originating
+MPI rank in one uint64 -- and writes it verbatim as the openPMD ``id`` record.
+:func:`particle_id_from_idcpu` keeps the packed value, stripping only the validity bit
+-- AMReX' id alone repeats across MPI ranks, so only id-and-rank together identify a
+particle -- and both readers set
+``status`` from the validity bit.
 
 Known limitations
 -----------------
-* ``add_n_particles`` assigns its own ids, so ``pg.id`` does not survive injection.
+* ``add_n_particles`` assigns its own ids, so ``pg.id`` does not survive injection: a
+  bunch read back carries ImpactX' ids, not the ones it went in with.
+* ImpactX writes a *zeroed* reference particle into its ``particles_lost`` output, so
+  :func:`read_beam_monitor` cannot convert that file on its own. Pass ``ref=`` with the
+  :class:`ImpactXRefPart` of the BeamMonitor iteration the particles were lost at.
 """
 
 from __future__ import annotations
 
+import pathlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,16 +76,19 @@ import numpy as np
 try:
     from beamphysics import ParticleGroup
     from beamphysics.species import charge_of, e_charge, mass_of
+    from beamphysics.status import ParticleStatus
+    from beamphysics.units import c_light
 except ImportError:  # pragma: no cover - openpmd-beamphysics < 0.15
     from pmd_beamphysics import ParticleGroup
     from pmd_beamphysics.species import charge_of, e_charge, mass_of
-
-C_LIGHT = 299792458.0
+    from pmd_beamphysics.status import ParticleStatus
+    from pmd_beamphysics.units import c_light
 
 __all__ = [
     "ImpactXRefPart",
     "particlegroup_to_impactx",
     "impactx_to_particlegroup_data",
+    "particle_id_from_idcpu",
     "refpart_snapshot",
     "apply_refpart",
     "species_of",
@@ -77,7 +97,9 @@ __all__ = [
     "particle_container_to_particlegroup",
     "UnrepresentableParticleData",
     "refpart_from_openpmd",
+    "beam_monitor_iterations",
     "read_beam_monitor",
+    "read_beam_monitor_data",
 ]
 
 
@@ -92,8 +114,9 @@ IMPACTX_TO_PMD_SPECIES = {
 }
 PMD_TO_IMPACTX_SPECIES = {v: k for k, v in IMPACTX_TO_PMD_SPECIES.items()}
 
+
 # --------------------------------------------------------------------------------------
-# Pure core (upstreamable: numpy + beamphysics only, no impactx import)
+# Reference particle
 # --------------------------------------------------------------------------------------
 
 
@@ -103,7 +126,7 @@ class ImpactXRefPart:
 
     Holding this as a plain dataclass rather than wrapping ``impactx.RefPart`` is what
     lets the converters run with no ImpactX object in the process -- which the openPMD
-    reader and most of the test suite rely on.
+    reader and the whole test suite rely on.
 
     Attributes
     ----------
@@ -112,7 +135,8 @@ class ImpactXRefPart:
     t : float
         ``c * t`` of the reference particle, in **metres** (ImpactX convention).
     px, py, pz : float
-        Momenta normalized by ``m * c``, i.e. ``beta_i * gamma``. Dimensionless.
+        Lab-frame momenta normalized by ``m * c``, i.e. ``beta_i * gamma``.
+        Dimensionless.
     pt : float
         ``-gamma`` of the reference particle. Dimensionless.
     mass_MeV : float
@@ -121,6 +145,9 @@ class ImpactXRefPart:
         Charge in units of the elementary charge, e.g. -1 for an electron.
     s : float
         Integrated path length along the reference orbit, in metres.
+    gyromagnetic_anomaly : float
+        Anomalous magnetic moment, dimensionless. Carried for round-tripping only;
+        `ParticleGroup` has no spin.
     """
 
     x: float
@@ -134,6 +161,7 @@ class ImpactXRefPart:
     mass_MeV: float
     charge_qe: float
     s: float = 0.0
+    gyromagnetic_anomaly: float = 0.0
 
     @property
     def mass_eV(self) -> float:
@@ -157,126 +185,39 @@ class ImpactXRefPart:
 
     @property
     def qm_SI(self) -> float:
-        """Charge over mass in C/kg, the form ``to_df()["qm"]`` reports."""
-        return self.qm_eV * C_LIGHT**2
+        """Charge over mass in C/kg, the form ``qm`` is written with in openPMD output."""
+        return self.qm_eV * c_light**2
 
 
-def particlegroup_to_impactx(pg: ParticleGroup, ref: ImpactXRefPart) -> dict:
-    """Convert a ``ParticleGroup`` to ImpactX fixed-s beam arrays.
-
-    Parameters
-    ----------
-    pg : ParticleGroup
-        The bunch to convert. Unless it already sits exactly on the reference plane it
-        is copied and drifted to ``ref.z``, so the input is never mutated.
-    ref : ImpactXRefPart
-        The reference particle the ImpactX coordinates are relative to.
-
-    Returns
-    -------
-    dict
-        Keys ``position_x``, ``position_y``, ``position_t``, ``momentum_x``,
-        ``momentum_y``, ``momentum_t`` (arrays), ``weighting`` (array, real particles
-        per macroparticle), ``qm`` (scalar, 1/eV) and ``species`` (str). These map
-        one-to-one onto ``ImpactXParticleContainer.add_n_particles``.
-    """
-    # The bunch must occupy a single plane. A t-coordinate bunch (spread in z) is
-    # drifted to its own mean z on a copy, so the input is never mutated. Note this is
-    # deliberately the bunch's own plane, not some lab z: in the local frame the plane
-    # *is* the reference particle's location.
-    if not pg.in_z_coordinates:
-        pg = pg.copy()
-        pg.drift_to_z()
-
-    mass_eV = ref.mass_eV
-    beta_gamma = ref.beta_gamma
-
-    position_x = pg.x
-    position_y = pg.y
-    position_t = C_LIGHT * pg.t - ref.t
-
-    momentum_x = pg.px / mass_eV / beta_gamma
-    momentum_y = pg.py / mass_eV / beta_gamma
-
-    # gamma - gamma_ref, written to avoid cancellation: both are ~4000 for a 2 GeV beam,
-    # and their difference is ~1e-3, so the naive form loses about 3.5 digits.
-    p_mc2 = (pg.p / mass_eV) ** 2
-    gamma = np.sqrt(1.0 + p_mc2)
-    dgamma = (p_mc2 - beta_gamma**2) / (gamma + ref.gamma)
-    momentum_t = -dgamma / beta_gamma
-
-    return {
-        "position_x": position_x,
-        "position_y": position_y,
-        "position_t": position_t,
-        "momentum_x": momentum_x,
-        "momentum_y": momentum_y,
-        "momentum_t": momentum_t,
-        "weighting": pg.weight / abs(charge_of(pg.species)),
-        "qm": ref.qm_eV,
-        "species": pg.species,
-    }
+def _reference_is_physical(ref: ImpactXRefPart) -> bool:
+    """True when ``ref`` has a positive mass and is actually moving."""
+    return bool(ref.mass_MeV > 0.0 and ref.gamma >= 1.0 and ref.beta_gamma > 0.0)
 
 
-def impactx_to_particlegroup_data(
-    data: dict,
-    ref: ImpactXRefPart,
-    species: str | None = None,
-) -> dict:
-    """Convert ImpactX fixed-s beam arrays to ``ParticleGroup`` data.
+def _check_reference_particle(ref: ImpactXRefPart) -> None:
+    """Refuse a reference particle the conversion cannot use.
 
-    The inverse of :func:`particlegroup_to_impactx`.
+    A default-constructed ``RefPart`` has zero mass and zero energy, which makes
+    ``beta_gamma`` zero and every converted momentum infinite. ImpactX writes exactly
+    that into its ``particles_lost`` output, so this is not a hypothetical.
 
     Parameters
     ----------
-    data : dict
-        Arrays keyed as ``ImpactXParticleContainer.to_df()`` names them:
-        ``position_x/y/t``, ``momentum_x/y/t``, ``weighting``. An ``id`` key is carried
-        through if present.
     ref : ImpactXRefPart
-        The reference particle the ImpactX coordinates are relative to.
-    species : str, optional
-        openPMD-beamphysics species name. Inferred from ``ref`` when omitted.
+        The reference particle to check.
 
-    Returns
-    -------
-    dict
-        Suitable for ``ParticleGroup(data=...)``: ``x``, ``y``, ``z`` in metres,
-        ``px``, ``py``, ``pz`` in eV/c, ``t`` in seconds, ``weight`` in Coulomb,
-        ``status`` and ``species``. The result is in z-coordinates: every ``z`` is
-        ``ref.z``, and the bunch length shows up as a spread in ``t``.
+    Raises
+    ------
+    ValueError
+        If the mass is not positive or the particle is not moving.
     """
-    if species is None:
-        species = pmd_species_of(ref)
-
-    mass_eV = ref.mass_eV
-    beta_gamma = ref.beta_gamma
-    n = len(np.asarray(data["position_x"]))
-
-    # In the local frame the reference particle is the origin: its transverse momentum
-    # is zero by construction and its longitudinal momentum is |p_ref|. ref.px / ref.pz
-    # are *lab* components and must not be mixed in here.
-    px_mc = beta_gamma * np.asarray(data["momentum_x"])
-    py_mc = beta_gamma * np.asarray(data["momentum_y"])
-    # ref.gamma is -ref.pt, so this is gamma_ref + (gamma - gamma_ref) = gamma.
-    gamma = ref.gamma - beta_gamma * np.asarray(data["momentum_t"])
-    pz_mc = np.sqrt(gamma**2 - 1.0 - px_mc**2 - py_mc**2)
-
-    pg_data = {
-        "x": np.asarray(data["position_x"]),
-        "y": np.asarray(data["position_y"]),
-        "z": np.zeros(n),
-        "px": px_mc * mass_eV,
-        "py": py_mc * mass_eV,
-        "pz": pz_mc * mass_eV,
-        "t": (ref.t + np.asarray(data["position_t"])) / C_LIGHT,
-        "weight": np.asarray(data["weighting"]) * abs(charge_of(species)),
-        "status": np.ones(n, dtype=int),
-        "species": species,
-    }
-    if "id" in data:
-        pg_data["id"] = np.asarray(data["id"])
-    return pg_data
+    if _reference_is_physical(ref):
+        return
+    raise ValueError(
+        f"The reference particle is not physical: mass_MeV={ref.mass_MeV}, "
+        f"gamma={ref.gamma}, beta_gamma={ref.beta_gamma}. A mass and an energy are "
+        "both required to convert ImpactX' normalized coordinates."
+    )
 
 
 def pmd_species_of(ref: ImpactXRefPart, rtol: float = 1e-6) -> str:
@@ -313,9 +254,242 @@ def pmd_species_of(ref: ImpactXRefPart, rtol: float = 1e-6) -> str:
     )
 
 
-#: ImpactX SoA columns that this module maps onto ParticleGroup fields. Anything else a
-#: container holds -- ``spin_x/y/z`` with ``sim.spin`` on, or a runtime component added
-#: with ``add_real_comp`` -- has no ParticleGroup representation.
+# --------------------------------------------------------------------------------------
+# Coordinate conversion
+# --------------------------------------------------------------------------------------
+
+
+def particlegroup_to_impactx(pg: ParticleGroup, ref: ImpactXRefPart) -> dict:
+    """Convert a ``ParticleGroup`` to ImpactX fixed-s beam arrays.
+
+    Parameters
+    ----------
+    pg : ParticleGroup
+        The bunch to convert. Unless it already sits exactly on one plane it is copied
+        and drifted to its own mean ``z``, so the input is never mutated. Note that
+        ``pg.z`` itself does not enter the result: in the local frame the plane *is*
+        the reference particle's location. ``pg.status`` is not carried either --
+        ImpactX has no equivalent -- so filter dead particles beforehand if that
+        matters.
+    ref : ImpactXRefPart
+        The reference particle the ImpactX coordinates are relative to.
+
+    Returns
+    -------
+    dict
+        Keys ``position_x``, ``position_y``, ``position_t``, ``momentum_x``,
+        ``momentum_y``, ``momentum_t`` (arrays), ``weighting`` (array, real particles
+        per macroparticle), ``qm`` (scalar, 1/eV) and ``species`` (str). These map
+        one-to-one onto ``ImpactXParticleContainer.add_n_particles``.
+    """
+    # The bunch must occupy a single plane. A t-coordinate bunch (spread in z) is
+    # drifted to its own mean z on a copy, so the input is never mutated.
+    _check_reference_particle(ref)
+
+    if not pg.in_z_coordinates:
+        pg = pg.copy()
+        pg.drift_to_z()
+
+    mass_eV = ref.mass_eV
+    beta_gamma = ref.beta_gamma
+
+    position_x = pg.x
+    position_y = pg.y
+    position_t = c_light * pg.t - ref.t
+
+    momentum_x = pg.px / mass_eV / beta_gamma
+    momentum_y = pg.py / mass_eV / beta_gamma
+
+    # gamma - gamma_ref through the algebraic identity
+    # (gamma^2 - gamma_ref^2) / (gamma + gamma_ref), which avoids subtracting two
+    # numbers that are both ~4000 for a 2 GeV beam and differ by ~1e-3. The float64
+    # representation of pg.p already sets the accuracy floor, so the gain over the
+    # plain difference is a small constant factor rather than orders of magnitude --
+    # but it is free.
+    p_mc2 = (pg.p / mass_eV) ** 2
+    gamma = np.sqrt(1.0 + p_mc2)
+    dgamma = (p_mc2 - beta_gamma**2) / (gamma + ref.gamma)
+    momentum_t = -dgamma / beta_gamma
+
+    return {
+        "position_x": position_x,
+        "position_y": position_y,
+        "position_t": position_t,
+        "momentum_x": momentum_x,
+        "momentum_y": momentum_y,
+        "momentum_t": momentum_t,
+        "weighting": pg.weight / abs(charge_of(pg.species)),
+        "qm": ref.qm_eV,
+        "species": pg.species,
+    }
+
+
+def impactx_to_particlegroup_data(
+    data: dict,
+    ref: ImpactXRefPart,
+    species: str | None = None,
+) -> dict:
+    """Convert ImpactX fixed-s beam arrays to ``ParticleGroup`` data.
+
+    The inverse of :func:`particlegroup_to_impactx`.
+
+    Parameters
+    ----------
+    data : dict
+        Arrays keyed as ``ImpactXParticleContainer.to_df()`` names them:
+        ``position_x/y/t``, ``momentum_x/y/t``, ``weighting``. Optional ``id`` and
+        ``status`` keys are carried through.
+    ref : ImpactXRefPart
+        The reference particle the ImpactX coordinates are relative to.
+    species : str, optional
+        openPMD-beamphysics species name. Inferred from ``ref`` when omitted.
+
+    Returns
+    -------
+    dict
+        Suitable for ``ParticleGroup(data=...)``: ``x``, ``y``, ``z`` in metres,
+        ``px``, ``py``, ``pz`` in eV/c, ``t`` in seconds, ``weight`` in Coulomb,
+        ``status`` and ``species``. The result is in z-coordinates: every ``z`` is
+        zero, the reference plane, and the bunch length shows up as a spread in ``t``.
+
+    Raises
+    ------
+    ValueError
+        If a particle's transverse momentum exceeds its total momentum, which makes
+        ``pz`` imaginary. That means ``data`` and ``ref`` do not belong together.
+    """
+    _check_reference_particle(ref)
+
+    if species is None:
+        species = pmd_species_of(ref)
+
+    mass_eV = ref.mass_eV
+    beta_gamma = ref.beta_gamma
+    n = len(np.asarray(data["position_x"]))
+
+    # In the local frame the reference particle is the origin: its transverse momentum
+    # is zero by construction and its longitudinal momentum is |p_ref|. ref.px / ref.pz
+    # are *lab* components and must not be mixed in here.
+    px_mc = beta_gamma * np.asarray(data["momentum_x"], dtype=float)
+    py_mc = beta_gamma * np.asarray(data["momentum_y"], dtype=float)
+    # ref.gamma is -ref.pt, so this is gamma_ref + (gamma - gamma_ref) = gamma.
+    gamma = ref.gamma - beta_gamma * np.asarray(data["momentum_t"], dtype=float)
+
+    pz_mc2 = gamma**2 - 1.0 - px_mc**2 - py_mc**2
+    n_bad = int(np.count_nonzero(pz_mc2 < 0.0))
+    if n_bad:
+        raise ValueError(
+            f"{n_bad} of {n} particles have a transverse momentum larger than their "
+            "total momentum, so pz would be imaginary. The reference particle most "
+            "likely does not belong to this bunch: check mass_MeV, pt and the "
+            "momentum normalization."
+        )
+    pz_mc = np.sqrt(pz_mc2)
+
+    if "status" in data:
+        status = np.asarray(data["status"])
+    else:
+        status = np.full(n, int(ParticleStatus.ALIVE))
+
+    pg_data = {
+        "x": np.asarray(data["position_x"], dtype=float),
+        "y": np.asarray(data["position_y"], dtype=float),
+        "z": np.zeros(n),  # Zero by definition in z-coordinates
+        "px": px_mc * mass_eV,
+        "py": py_mc * mass_eV,
+        "pz": pz_mc * mass_eV,
+        "t": (ref.t + np.asarray(data["position_t"], dtype=float)) / c_light,
+        "weight": np.asarray(data["weighting"], dtype=float) * abs(charge_of(species)),
+        "status": status,
+        "species": species,
+    }
+    if "id" in data:
+        pg_data["id"] = np.asarray(data["id"])
+    return pg_data
+
+
+# --------------------------------------------------------------------------------------
+# Per-particle data ParticleGroup cannot hold
+# --------------------------------------------------------------------------------------
+
+#: The spin components, which ImpactX always allocates and always writes. They stay at
+#: exactly zero unless the beam was seeded with a spin distribution -- ``sim.spin =
+#: True`` alone is not enough, the gate is the ``spin_distr`` argument to
+#: ``add_particles``. So testing for "any non-zero" is exact: zero means there is
+#: genuinely nothing to lose.
+SPIN_COLUMNS = ("spin_x", "spin_y", "spin_z")
+
+
+class UnrepresentableParticleData(NotImplementedError):
+    """Raised when a bunch carries per-particle data ``ParticleGroup`` cannot hold.
+
+    Converting anyway would return a bunch that looks right and has silently lost
+    physics, so the conversion refuses instead. Pass ``strict=False`` to
+    :func:`read_beam_monitor` to drop the extra data deliberately.
+    """
+
+
+def _unrepresentable_in(columns: dict) -> list[str]:
+    """Name the per-particle data in ``columns`` that ``ParticleGroup`` cannot hold.
+
+    Parameters
+    ----------
+    columns : dict
+        Extra per-particle arrays keyed by ImpactX SoA name, i.e. everything beyond
+        the coordinates, weighting and id that this module maps.
+
+    Returns
+    -------
+    list of str
+        Human-readable descriptions, empty when the bunch converts losslessly.
+    """
+    carried = []
+    if any(
+        name in columns and np.any(np.asarray(columns[name]) != 0.0)
+        for name in SPIN_COLUMNS
+    ):
+        carried.append("spin (spin_x/y/z)")
+    runtime = sorted(name for name in columns if name not in SPIN_COLUMNS)
+    if runtime:
+        carried.append(f"runtime components {runtime}")
+    return carried
+
+
+def _check_representable(columns: dict) -> None:
+    """Refuse to convert a bunch whose extra per-particle data would be dropped.
+
+    Parameters
+    ----------
+    columns : dict
+        Extra per-particle arrays keyed by ImpactX SoA name.
+
+    Raises
+    ------
+    UnrepresentableParticleData
+        If any spin component is non-zero, or any runtime component is present.
+    """
+    carried = _unrepresentable_in(columns)
+    if not carried:
+        return
+    raise UnrepresentableParticleData(
+        f"This bunch carries {' and '.join(carried)}, which ParticleGroup cannot "
+        "represent. Converting would silently drop it. Pass strict=False to drop it "
+        "deliberately, or work with the ImpactX particle container directly. Note "
+        "that ImpactX's particles_lost output always carries a runtime 's_lost' "
+        "component."
+    )
+
+
+# END UPSTREAM CORE
+# --------------------------------------------------------------------------------------
+# Live-object wrappers (these touch impactx)
+# --------------------------------------------------------------------------------------
+
+#: ImpactX SoA columns, as ``to_df()`` names them, that the converters map onto
+#: ParticleGroup fields. Anything else a container holds -- ``spin_x/y/z`` when the beam
+#: was seeded with a spin distribution, or a runtime component added with
+#: ``add_real_comp`` -- has no ParticleGroup representation, and is what
+#: :func:`_check_representable` is asked about.
 _MAPPED_SOA_COLUMNS = frozenset(
     {
         "idcpu",
@@ -329,69 +503,6 @@ _MAPPED_SOA_COLUMNS = frozenset(
         "weighting",
     }
 )
-
-#: The spin components, which ImpactX always allocates. They stay at exactly zero
-#: unless the beam was seeded with a spin distribution -- ``sim.spin = True`` alone is
-#: not enough, the gate is the ``spin_distr`` argument to ``add_particles``. So testing
-#: for "any non-zero" is exact: zero means there is genuinely nothing to lose.
-#:
-#: ImpactXSimulator has no way to pass a spin distribution, so a bunch it produces
-#: always converts. The guard matters for containers built by hand and for
-#: :func:`read_beam_monitor` reading a file from a spin-seeded run.
-SPIN_COLUMNS = ("spin_x", "spin_y", "spin_z")
-
-
-class UnrepresentableParticleData(NotImplementedError):
-    """Raised when a bunch carries per-particle data ``ParticleGroup`` cannot hold.
-
-    Converting anyway would return a bunch that looks right and has silently lost
-    physics, so the conversion refuses instead.
-    """
-
-
-def _check_representable(columns: dict) -> None:
-    """Refuse to convert a bunch whose extra per-particle data would be dropped.
-
-    Parameters
-    ----------
-    columns : dict
-        Per-particle arrays keyed by ImpactX SoA name.
-
-    Raises
-    ------
-    UnrepresentableParticleData
-        If any spin component is non-zero, or any unmapped component is present.
-    """
-    carries_spin = any(
-        name in columns and np.any(np.asarray(columns[name]) != 0.0)
-        for name in SPIN_COLUMNS
-    )
-    runtime = sorted(
-        name
-        for name in columns
-        if name not in _MAPPED_SOA_COLUMNS and name not in SPIN_COLUMNS
-    )
-    if not carries_spin and not runtime:
-        return
-
-    carried = []
-    if carries_spin:
-        carried.append("spin (spin_x/y/z)")
-    if runtime:
-        carried.append(f"runtime components {runtime}")
-    raise UnrepresentableParticleData(
-        f"This bunch carries {' and '.join(carried)}, which openPMD-beamphysics' "
-        "ParticleGroup cannot represent, and nothing in LUME analyses, chains or plots "
-        "today. Converting would silently drop it. Work with the ImpactX container "
-        "directly for these quantities. Spin *moments* are unaffected and are exposed "
-        "as ordinary variables when sim.spin is on."
-    )
-
-
-# END UPSTREAM CORE
-# --------------------------------------------------------------------------------------
-# Live-object wrappers (these touch impactx)
-# --------------------------------------------------------------------------------------
 
 
 def refpart_snapshot(ref) -> ImpactXRefPart:
@@ -419,6 +530,7 @@ def refpart_snapshot(ref) -> ImpactXRefPart:
         mass_MeV=ref.mass_MeV,
         charge_qe=ref.charge_qe,
         s=ref.s,
+        gyromagnetic_anomaly=ref.gyromagnetic_anomaly,
     )
 
 
@@ -426,6 +538,7 @@ def apply_refpart(ref, snapshot: ImpactXRefPart) -> None:
     """Write an :class:`ImpactXRefPart` back onto a live ``impactx.RefPart``."""
     ref.set_charge_qe(snapshot.charge_qe)
     ref.set_mass_MeV(snapshot.mass_MeV)
+    ref.set_gyromagnetic_anomaly(snapshot.gyromagnetic_anomaly)
     ref.x, ref.y, ref.z, ref.t = snapshot.x, snapshot.y, snapshot.z, snapshot.t
     ref.px, ref.py, ref.pz, ref.pt = (
         snapshot.px,
@@ -557,7 +670,25 @@ def particle_container_to_particlegroup(
         ref = pc.ref
     snapshot = refpart_snapshot(ref)
     data = {name: df[name].to_numpy() for name in df.columns}
-    _check_representable(data)
+    try:
+        _check_representable(
+            {
+                name: values
+                for name, values in data.items()
+                if name not in _MAPPED_SOA_COLUMNS
+            }
+        )
+    except UnrepresentableParticleData as exc:
+        # the upstream message is code-agnostic; add what a LUME user needs to hear
+        raise UnrepresentableParticleData(
+            f"{exc} Nothing in LUME analyses, chains or plots uses these today. "
+            "Spin *moments* are unaffected and are exposed as ordinary variables "
+            "when sim.spin is on."
+        ) from exc
+    if "idcpu" in data:
+        ids, valid = particle_id_from_idcpu(data["idcpu"])
+        data["id"] = ids
+        data["status"] = np.where(valid, int(ParticleStatus.ALIVE), 0)
     return ParticleGroup(
         data=impactx_to_particlegroup_data(data, snapshot, species=species)
     )
@@ -568,23 +699,24 @@ def particle_container_to_particlegroup(
 # openPMD BeamMonitor reader
 #
 # ImpactX's elements.BeamMonitor writes standard openPMD with the species always named
-# "beam" ("particles_lost" for the loss monitor), records position/{x,y,t},
-# momentum/{x,y,t}, weighting, qm and id, all with unitSI == 1, plus the reference
-# particle as per-iteration species attributes. Verified against 26.08.
+# "beam" -- also in the particles_lost output, where only the *file* is named
+# differently. It records position/{x,y,t}, momentum/{x,y,t}, positionOffset/{x,y,t},
+# weighting, qm, spin/{x,y,z} and id, plus the reference particle and the reduced beam
+# characteristics as per-iteration species attributes. Verified against ImpactX 26.08.
 #
 # This path needs no live ImpactX object, which is what makes ImpactXRefPart a plain
 # dataclass rather than a wrapper around impactx.RefPart.
 # --------------------------------------------------------------------------------------
 
-#: Elementary charge in Coulomb, for decoding ``charge_ref`` / ``mass_ref``.
-E_CHARGE_C = 1.602176634e-19
-
-#: openPMD records that carry information already mapped onto ParticleGroup fields, or
-#: that are bookkeeping rather than per-particle data. Everything else in a species is
-#: collected only so the refusal can name it. ``positionOffset`` is required by the
-#: openPMD standard and
-#: is all-zero for ImpactX, so it must not become an extra.
-OPENPMD_STANDARD_RECORDS = frozenset(
+#: openPMD records this reader consumes or deliberately ignores. Everything else in a
+#: species is per-particle data ParticleGroup has no place for -- ImpactX's ``spin``,
+#: or a runtime component such as the ``s/lost`` of the particles_lost output.
+#:
+#: ``positionOffset`` holds ``(x_ref, y_ref, t_ref)``, not zeros: the longitudinal part
+#: is applied via the ``t_ref`` attribute, the transverse part is deliberately not, see
+#: the module docstring. ``qm`` is redundant with the reference particle's mass and
+#: charge, which are what this reader uses.
+_CONSUMED_RECORDS = frozenset(
     {
         "position",
         "positionOffset",
@@ -592,14 +724,49 @@ OPENPMD_STANDARD_RECORDS = frozenset(
         "weighting",
         "qm",
         "id",
-        "charge",
-        "mass",
-        "particleStatus",
-        "particlePatches",
-        "time",
-        "timeOffset",
     }
 )
+
+#: ImpactX writes this zero-extent placeholder instead of particle records when a
+#: BeamMonitor is configured with ``particles=False`` (moments-only output).
+_EMPTY_PLACEHOLDER_RECORD = "empty"
+
+# AMReX packs a particle's identity into one uint64 ``idcpu``: bit 63 marks the
+# particle valid, bits 24-62 hold the id, bits 0-23 the originating MPI rank. The id
+# counter is per-rank, so the id on its own repeats across the ranks of a parallel run
+# -- only the packed value is globally unique, and that is what becomes the
+# ``ParticleGroup`` id.
+_AMREX_VALID_BIT = np.uint64(1) << np.uint64(63)
+
+
+def particle_id_from_idcpu(idcpu) -> tuple[np.ndarray, np.ndarray]:
+    """Split AMReX's packed ``idcpu`` into a ``ParticleGroup`` id and a validity flag.
+
+    ImpactX writes the raw ``idcpu`` as the openPMD ``id`` record. Only the validity
+    bit is stripped off here, for two reasons: with it set the value exceeds the range
+    of a signed 64-bit integer, which is what ``ParticleGroup`` stores ids in, and
+    aliveness belongs in ``status`` rather than in the id. Everything identifying the
+    particle -- AMReX' per-rank id *and* the rank it came from -- is kept, so the
+    result is unique across a parallel run where the id alone would not be.
+
+    The original value is recovered as ``np.uint64(id) | (np.uint64(1) << 63)`` for a
+    live particle; AMReX' own id and rank are ``id >> 24`` and ``id & 0xFFFFFF``.
+
+    Parameters
+    ----------
+    idcpu : array_like of uint64
+        The ``id`` record as stored.
+
+    Returns
+    -------
+    ids : np.ndarray of int64
+        ``idcpu`` with the validity bit cleared.
+    valid : np.ndarray of bool
+        True where the particle is marked valid.
+    """
+    idcpu = np.asarray(idcpu, dtype=np.uint64)
+    valid = (idcpu & _AMREX_VALID_BIT).astype(bool)
+    return (idcpu & ~_AMREX_VALID_BIT).astype(np.int64), valid
 
 
 def refpart_from_openpmd(species: Any) -> ImpactXRefPart:
@@ -615,7 +782,26 @@ def refpart_from_openpmd(species: Any) -> ImpactXRefPart:
     ImpactXRefPart
         ``mass_ref`` is stored in kg and ``charge_ref`` in Coulomb, so both are
         converted here to the MeV / elementary-charge units the converters use.
+
+    Raises
+    ------
+    KeyError
+        If the species carries no reference particle attributes, i.e. it was not
+        written by an ImpactX BeamMonitor.
     """
+    attributes = set(species.attributes)
+    required = {
+        "x_ref", "y_ref", "z_ref", "t_ref",
+        "px_ref", "py_ref", "pz_ref", "pt_ref",
+        "mass_ref", "charge_ref", "s_ref",
+    }  # fmt: skip
+    missing = sorted(required - attributes)
+    if missing:
+        raise KeyError(
+            f"Species is missing the reference particle attributes {missing}. "
+            "This does not look like ImpactX BeamMonitor output."
+        )
+
     get = species.get_attribute
     return ImpactXRefPart(
         x=get("x_ref"),
@@ -626,102 +812,235 @@ def refpart_from_openpmd(species: Any) -> ImpactXRefPart:
         py=get("py_ref"),
         pz=get("pz_ref"),
         pt=get("pt_ref"),
-        mass_MeV=get("mass_ref") * C_LIGHT**2 / E_CHARGE_C / 1.0e6,
-        charge_qe=get("charge_ref") / E_CHARGE_C,
+        mass_MeV=get("mass_ref") * c_light**2 / e_charge / 1.0e6,
+        charge_qe=get("charge_ref") / e_charge,
         s=get("s_ref"),
+        gyromagnetic_anomaly=(
+            get("gyromagnetic_anomaly_ref")
+            if "gyromagnetic_anomaly_ref" in attributes
+            else 0.0
+        ),
     )
 
 
-def read_beam_monitor(
-    path: str,
+def _import_openpmd_api():
+    """Import ``openpmd_api``, with an actionable message when it is missing."""
+    try:
+        import openpmd_api
+    except ImportError as exc:  # pragma: no cover - depends on the install
+        raise ImportError(
+            "Reading ImpactX BeamMonitor output needs the openpmd-api Python package: "
+            "conda install -c conda-forge openpmd-api, or pip install openpmd-api."
+        ) from exc
+    return openpmd_api
+
+
+def read_beam_monitor_data(
+    path: str | pathlib.Path,
     iteration: int | None = None,
     species_name: str = "beam",
     species: str | None = None,
+    strict: bool = True,
+    ref: ImpactXRefPart | None = None,
+) -> dict:
+    """Read an ImpactX ``BeamMonitor`` openPMD file into ``ParticleGroup`` data.
+
+    See :func:`read_beam_monitor` for the parameters; this is the same reader without
+    the final ``ParticleGroup`` construction.
+
+    Returns
+    -------
+    dict
+        Suitable for ``ParticleGroup(data=...)``.
+    """
+    io = _import_openpmd_api()
+
+    series = io.Series(str(path), io.Access.read_only)
+    try:
+        iterations = list(series.iterations)
+        if not iterations:
+            raise KeyError(f"No iterations in {str(path)!r}.")
+        if iteration is None:
+            iteration = iterations[-1]
+        elif iteration not in iterations:
+            raise KeyError(
+                f"Iteration {iteration} not in {str(path)!r}; have {iterations}."
+            )
+
+        particles = series.iterations[iteration].particles
+        if species_name not in particles:
+            raise KeyError(
+                f"Species {species_name!r} not in {str(path)!r}; have "
+                f"{list(particles)}. ImpactX always names it 'beam', including in "
+                "particles_lost output."
+            )
+        beam = particles[species_name]
+
+        records = list(beam)
+        if _EMPTY_PLACEHOLDER_RECORD in records:
+            raise KeyError(
+                f"{str(path)!r} iteration {iteration} holds no particles: this "
+                "BeamMonitor was configured with particles=False and wrote only the "
+                "reduced beam characteristics, which are on the species' attributes."
+            )
+
+        def _load(record_name: str, component: str):
+            record_component = beam[record_name][component]
+            return record_component, record_component.load_chunk()
+
+        components = {
+            "position_x": _load("position", "x"),
+            "position_y": _load("position", "y"),
+            "position_t": _load("position", "t"),
+            "momentum_x": _load("momentum", "x"),
+            "momentum_y": _load("momentum", "y"),
+            "momentum_t": _load("momentum", "t"),
+            "weighting": _load("weighting", io.Record_Component.SCALAR),
+        }
+        idcpu = beam["id"][io.Record_Component.SCALAR].load_chunk()
+
+        # ParticleGroup cannot hold spin or runtime components, so collect them --
+        # either to refuse loudly, or to report what strict=False threw away.
+        extras = {}
+        for name in records:
+            if name in _CONSUMED_RECORDS:
+                continue
+            for component, record_component in beam[name].items():
+                key = (
+                    name
+                    if component == io.Record_Component.SCALAR
+                    else f"{name}_{component}"
+                )
+                extras[key] = record_component.load_chunk()
+
+        file_ref = refpart_from_openpmd(beam)
+        series.flush()
+
+        # openPMD stores values that must be multiplied by unitSI to reach the unit the
+        # record declares. ImpactX writes 1.0 throughout, so this is a no-op today.
+        data = {
+            key: np.asarray(chunk) * record_component.unit_SI
+            for key, (record_component, chunk) in components.items()
+        }
+        extras = {key: np.asarray(chunk) for key, chunk in extras.items()}
+        ids, valid = particle_id_from_idcpu(idcpu)
+    finally:
+        series.close()
+
+    if ref is None:
+        ref = file_ref
+        if not _reference_is_physical(ref):
+            raise ValueError(
+                f"{str(path)!r} iteration {iteration} carries a zeroed reference "
+                f"particle (mass_ref={ref.mass_MeV} MeV, gamma_ref={ref.gamma}), so "
+                "its normalized coordinates cannot be converted. ImpactX writes this "
+                "for its particles_lost output. Pass ref= with the ImpactXRefPart of "
+                "the BeamMonitor iteration the particles were lost at, which "
+                "refpart_from_openpmd() reads from the monitor file."
+            )
+
+    if strict:
+        _check_representable(extras)
+
+    data["id"] = ids
+    # openPMD-beamphysics reads status == 1 as alive and anything else as not alive;
+    # there is no enum member for "lost", so a plain 0 it is.
+    data["status"] = np.where(valid, int(ParticleStatus.ALIVE), 0)
+
+    return impactx_to_particlegroup_data(data, ref, species=species)
+
+
+def read_beam_monitor(
+    path: str | pathlib.Path,
+    iteration: int | None = None,
+    species_name: str = "beam",
+    species: str | None = None,
+    strict: bool = True,
+    ref: ImpactXRefPart | None = None,
 ) -> ParticleGroup:
     """Read an ImpactX ``BeamMonitor`` openPMD file into a ``ParticleGroup``.
 
     Parameters
     ----------
-    path : str
-        Path to the file ImpactX wrote, e.g. ``diags/openPMD/monitor.h5``.
+    path : str or pathlib.Path
+        Path to the file ImpactX wrote, e.g. ``diags/openPMD/monitor.h5``. Any backend
+        openpmd-api supports works, including ``.bp`` and a ``%T``-templated file-based
+        series.
     iteration : int, optional
         Which iteration to read. The last one when omitted.
     species_name : str
-        openPMD species to read. ImpactX writes ``"beam"``, and ``"particles_lost"``
-        for the loss monitor.
+        openPMD species to read. ImpactX always writes ``"beam"`` -- its lost-particle
+        output differs in the *file* name (``particles_lost.*``), not the species name.
     species : str, optional
         openPMD-beamphysics species name; inferred from the reference particle when
         omitted.
+    strict : bool
+        When True (the default), refuse to read a bunch that carries per-particle data
+        `ParticleGroup` cannot hold -- non-zero spin, or a runtime component such as
+        the ``s_lost`` that ImpactX's ``particles_lost`` output always carries. Set it
+        to False to drop that data and read the bunch anyway.
+    ref : ImpactXRefPart, optional
+        Reference particle to interpret the coordinates against. Taken from the file
+        when omitted, which is what you want for a BeamMonitor. ImpactX's
+        ``particles_lost`` output carries a *zeroed* reference particle, so reading it
+        requires passing the one from the corresponding monitor iteration, e.g.
+        ``refpart_from_openpmd(series.iterations[n].particles["beam"])``.
 
     Returns
     -------
     ParticleGroup
-        In z-coordinates, matching what
-        :func:`particle_container_to_particlegroup` returns for the same step.
+        In z-coordinates: every ``z`` is zero, the bunch length is a spread in ``t``,
+        and the transverse coordinates are relative to the reference particle. See the
+        module docstring for the frame conventions.
 
     Raises
     ------
     KeyError
-        If the requested iteration or species is not in the file.
+        If the requested iteration or species is not in the file, if the species is
+        not ImpactX BeamMonitor output, or if the monitor recorded no particles.
     UnrepresentableParticleData
-        If the monitor recorded spin or runtime components.
+        If ``strict`` and the monitor recorded spin or runtime components.
+    ValueError
+        If neither ``ref`` nor the file provides a usable reference particle.
+
+    Examples
+    --------
+    >>> from beamphysics.interfaces.impactx import read_beam_monitor
+    >>> P = read_beam_monitor("diags/openPMD/monitor.h5")  # doctest: +SKIP
+    >>> P.norm_emit_x  # doctest: +SKIP
     """
-    try:
-        import openpmd_api as io
-    except ImportError as exc:  # pragma: no cover - depends on the install
-        raise ImportError(
-            "Reading BeamMonitor output needs the openpmd-api Python package. The "
-            "conda-forge impactx package pulls it in; with the impactx-noacc wheel "
-            "install it explicitly, e.g. pip install 'lume-impactx[impactx]'."
-        ) from exc
-
-    series = io.Series(path, io.Access.read_only)
-    iterations = list(series.iterations)
-    if not iterations:
-        raise KeyError(f"No iterations in {path!r}.")
-    if iteration is None:
-        iteration = iterations[-1]
-    elif iteration not in iterations:
-        raise KeyError(f"Iteration {iteration} not in {path!r}; have {iterations}.")
-
-    particles = series.iterations[iteration].particles
-    if species_name not in particles:
-        raise KeyError(
-            f"Species {species_name!r} not in {path!r}; have {list(particles)}."
+    return ParticleGroup(
+        data=read_beam_monitor_data(
+            path,
+            iteration=iteration,
+            species_name=species_name,
+            species=species,
+            strict=strict,
+            ref=ref,
         )
-    beam = particles[species_name]
+    )
 
-    chunks = {
-        "position_x": beam["position"]["x"].load_chunk(),
-        "position_y": beam["position"]["y"].load_chunk(),
-        "position_t": beam["position"]["t"].load_chunk(),
-        "momentum_x": beam["momentum"]["x"].load_chunk(),
-        "momentum_y": beam["momentum"]["y"].load_chunk(),
-        "momentum_t": beam["momentum"]["t"].load_chunk(),
-        "weighting": beam["weighting"][io.Record_Component.SCALAR].load_chunk(),
-    }
 
-    # A monitor writes spin when sim.spin is on, and any runtime SoA component too.
-    # ParticleGroup cannot hold those, so collect them only to refuse loudly rather
-    # than hand back a bunch that has quietly lost them.
-    unrepresentable = {}
-    for name in beam:
-        if name in OPENPMD_STANDARD_RECORDS:
-            continue
-        for component, values in beam[name].items():
-            key = (
-                name
-                if component == io.Record_Component.SCALAR
-                else f"{name}_{component}"
-            )
-            unrepresentable[key] = values.load_chunk()
+def beam_monitor_iterations(path: str | pathlib.Path) -> list[int]:
+    """List the iterations available in an ImpactX ``BeamMonitor`` file.
 
-    ref = refpart_from_openpmd(beam)
-    series.flush()
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Path to the file ImpactX wrote.
 
-    _check_representable({k: np.asarray(v) for k, v in unrepresentable.items()})
-    data = {key: np.asarray(value) for key, value in chunks.items()}
-    return ParticleGroup(data=impactx_to_particlegroup_data(data, ref, species=species))
+    Returns
+    -------
+    list of int
+        The iteration numbers, in file order.
+    """
+    io = _import_openpmd_api()
+
+    series = io.Series(str(path), io.Access.read_only)
+    try:
+        return list(series.iterations)
+    finally:
+        series.close()
 
 
 # END UPSTREAM READER

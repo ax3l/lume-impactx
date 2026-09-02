@@ -11,8 +11,8 @@ import pytest
 from beamphysics import ParticleGroup
 
 from lume_impactx.utils import (
-    C_LIGHT,
     ImpactXRefPart,
+    c_light,
     impactx_to_particlegroup_data,
     particlegroup_to_impactx,
     pmd_species_of,
@@ -21,7 +21,7 @@ from lume_impactx.utils import (
 
 def test_qm_units_relate_by_c_squared(electron_ref):
     """to_df() reports qm in C/kg while add_n_particles wants 1/eV."""
-    assert electron_ref.qm_SI / C_LIGHT**2 == pytest.approx(
+    assert electron_ref.qm_SI / c_light**2 == pytest.approx(
         electron_ref.qm_eV, rel=1e-15
     )
     # the value ImpactX itself reports for an electron
@@ -85,8 +85,15 @@ def test_weighting_counts_real_particles(bunch, electron_ref):
     assert data["qm"] == pytest.approx(electron_ref.qm_eV, rel=1e-15)
 
 
-def test_momentum_t_is_cancellation_safe(bunch, electron_ref):
-    """The naive gamma - gamma_ref form loses ~3.5 digits; ours must not."""
+def test_momentum_t_matches_the_plain_difference(bunch, electron_ref):
+    """The algebraic identity must agree with the plain gamma - gamma_ref difference.
+
+    Not a precision claim. Measured against a longdouble reference across
+    10 MeV..10 GeV and dp/p 1e-3..1e-12, the identity's error ratio to the plain
+    difference is 0.12x..1.57x -- noise around unity, worse as often as better, since
+    pg.p's float64 representation sets the floor for both. This asserts equivalence and
+    that the round trip closes, which is what actually matters.
+    """
     data = particlegroup_to_impactx(bunch, electron_ref)
 
     mass_eV = electron_ref.mass_eV
@@ -287,7 +294,7 @@ def test_qm_unit_depends_on_insertion_path(impactx_session, bunch):
     )
     qm_via_add = float(beam.to_df(local=True)["qm"].iloc[0])
     assert qm_via_add == pytest.approx(ref.qm_SI, rel=1e-9)
-    assert qm_via_add / C_LIGHT**2 == pytest.approx(qm_via_add_n, rel=1e-9)
+    assert qm_via_add / c_light**2 == pytest.approx(qm_via_add_n, rel=1e-9)
 
 
 # --------------------------------------------------------------------------------------
@@ -382,7 +389,7 @@ def test_refusal_names_the_alternative(impactx_session):
     with pytest.raises(UnrepresentableParticleData) as excinfo:
         particle_container_to_particlegroup(beam)
     message = str(excinfo.value)
-    assert "ImpactX container directly" in message
+    assert "ImpactX particle container directly" in message
     assert "moments" in message
 
 
@@ -500,3 +507,71 @@ def test_matching_species_still_injects(impactx_session, bunch):
     beam.ref.set_species("electron").set_kin_energy_MeV(2.0e3)
     add_particlegroup(beam, bunch)
     assert beam.total_number_of_particles() == len(bunch.x)
+
+
+def test_the_particle_id_keeps_the_rank_not_just_the_id():
+    """Only id-and-rank together identify a particle, so both are kept.
+
+    AMReX packs a per-rank counter into bits 24..62 and the originating rank into bits
+    0..23. The counter alone repeats across ranks, so using it as the openPMD id would
+    hand back colliding ids for any parallel run. On a single rank the rank field is all
+    zero, which is why unpacking looks correct until it is run in parallel.
+    """
+    import numpy as np
+
+    from lume_impactx.utils import particle_id_from_idcpu
+
+    valid_bit = np.uint64(1) << np.uint64(63)
+    # The same AMReX counter (5) as seen from two different ranks.
+    rank0 = valid_bit | (np.uint64(5) << np.uint64(24)) | np.uint64(0)
+    rank1 = valid_bit | (np.uint64(5) << np.uint64(24)) | np.uint64(1)
+    lost = (np.uint64(7) << np.uint64(24)) | np.uint64(0)
+
+    ids, valid = particle_id_from_idcpu(np.array([rank0, rank1, lost], dtype=np.uint64))
+
+    assert ids[0] != ids[1], "two ranks must not collide"
+    assert valid.tolist() == [True, True, False]
+    # Aliveness lives in status, so only that bit is stripped; everything identifying
+    # the particle survives, and AMReX' own counter and rank are recoverable.
+    assert (int(ids[0]) >> 24, int(ids[0]) & 0xFFFFFF) == (5, 0)
+    assert (int(ids[1]) >> 24, int(ids[1]) & 0xFFFFFF) == (5, 1)
+
+
+def test_the_particle_id_fits_a_particlegroup():
+    """Stripping the validity bit is what makes the value fit int64, which is what
+    ParticleGroup stores ids in -- the raw idcpu exceeds its positive range."""
+    import numpy as np
+
+    from lume_impactx.utils import particle_id_from_idcpu
+
+    packed = np.array(
+        [9223372036871553024, 9223372070409207808, 9223372036888330240],
+        dtype=np.uint64,
+    )
+    assert packed.max() > np.iinfo(np.int64).max
+    ids, valid = particle_id_from_idcpu(packed)
+    assert valid.all()
+    assert ids.dtype == np.int64
+    assert (ids > 0).all()
+
+    n = len(packed)
+    pg = ParticleGroup(
+        data={
+            "x": np.zeros(n),
+            "y": np.zeros(n),
+            "z": np.zeros(n),
+            "px": np.zeros(n),
+            "py": np.zeros(n),
+            "pz": np.full(n, 1e8),
+            "t": np.zeros(n),
+            "status": np.ones(n, dtype=int),
+            "weight": np.full(n, 1e-12),
+            "species": "electron",
+            "id": ids,
+        }
+    )
+    assert np.array_equal(pg.id, ids)
+    # The original idcpu is recovered by putting the validity bit back.
+    assert np.array_equal(
+        pg.id.astype(np.uint64) | (np.uint64(1) << np.uint64(63)), packed
+    )
