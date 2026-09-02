@@ -255,6 +255,22 @@ with markers and warn instead:
 lattice = lattice_from_tao(tao, nslice=10, skip_unsupported=True)
 ```
 
+## Species
+
+The species comes from the **lattice** — what Bmad actually tracked, and what every
+magnet strength in the lattice is normalised to — not from the bunch's own label.
+
+This matters more than it sounds. A Bmad file that sets no `parameter[particle]`
+defaults to **positron**, and `tao.particles()` takes its species from the beam file's
+metadata, so an electron beam file in a defaulted lattice yields a bunch labelled
+`electron` that Bmad nonetheless tracks against positron-normalised magnets. Trusting
+the bunch there tracked **100% away from Bmad, silently**.
+
+The two disagreeing is a setup this translator cannot reproduce — measured 100% off
+whichever species is chosen — so it raises rather than picking one. Set
+`parameter[particle]` to match the beam, or pass `species=` to override both the
+reference and the bunch label if you know they are consistent.
+
 ## Reference energy
 
 Bmad holds `p0c` fixed across an `rfcavity` while ImpactX's reference particle really is

@@ -876,13 +876,22 @@ def tao_with_beam(tmp_path, monkeypatch):
     """A Tao model with a tracked beam, from an inline lattice."""
     counter = itertools.count()
 
-    def build(body: str, line: str, e_tot: float = 100e6):
+    def build(
+        body: str,
+        line: str,
+        e_tot: float = 100e6,
+        particle: str | None = "electron",
+    ):
         directory = tmp_path / f"beam{next(counter)}"
         directory.mkdir()
         (directory / "lat.bmad").write_text(
-            f"parameter[geometry] = open\nparameter[particle] = electron\n"
-            f"parameter[e_tot] = {e_tot}\nbeginning[beta_a] = 10\n"
-            f"beginning[beta_b] = 10\n{body}\nlat: line = ({line})\nuse, lat\n"
+            "parameter[geometry] = open\n"
+            + (f"parameter[particle] = {particle}\n" if particle else "")
+            + f"parameter[e_tot] = {e_tot}\nbeginning[beta_a] = 10\n"
+            # d1 is predefined, matching the track_both fixture, so a case can be
+            # written for either harness without redefining its drift.
+            f"beginning[beta_b] = 10\nd1: drift, l = 0.4\n{body}\n"
+            f"lat: line = ({line})\nuse, lat\n"
         )
         (directory / "tao.init").write_text(
             "&tao_start\n/\n&tao_design_lattice\n"
@@ -1115,3 +1124,258 @@ def test_a_bad_range_says_why(tao_with_beam):
         ImpactXSimulator.from_tao(tao, nslice=8, track_start="NOWHERE")
     with pytest.raises(ValueError, match="nothing to track"):
         ImpactXSimulator.from_tao(tao, nslice=8, track_start="SCR", track_end="MID")
+
+
+# -- linear maps -----------------------------------------------------------------------
+#
+# Tracking compares particles, so it is limited by macroparticle statistics and barely
+# resolves dispersion (R16/R26) or momentum compaction (R56). The linear map is
+# noise-free and reaches ~1e-15, which separates a linear-order disagreement from a
+# nonlinear one -- the two are indistinguishable in a tracking residual.
+
+
+def _map_difference(tao, simulator) -> float:
+    """Worst relative difference between Tao's mat6 and ImpactX's transfer map.
+
+    The two use different longitudinal coordinates: ImpactX carries (t, pt) where Bmad
+    carries (z, pz), related by t = -z/beta and pt = -beta*pz. So the maps differ by a
+    similarity transform, D = diag(1, 1, 1, 1, -1/beta, -beta), and comparing them raw
+    reports 1.9e-1 on a bend that actually agrees to 4e-15.
+    """
+    import numpy as np
+
+    attribs = dict(tao.ele_gen_attribs("BEGINNING"))
+    beta = attribs["P0C"] / attribs["E_TOT"]
+    transform = np.diag([1.0, 1.0, 1.0, 1.0, -1.0 / beta, -beta])
+
+    bmad = np.array(tao.matrix("BEGINNING", "END")["mat6"])
+    impactx = np.asarray(simulator.results["transfer_map"])
+    converted = np.linalg.inv(transform) @ impactx @ transform
+    return np.abs(bmad - converted).max() / max(np.abs(bmad).max(), 1e-30)
+
+
+@pytest.mark.parametrize(
+    ("label", "body", "line"),
+    [
+        ("drift", "", "d1"),
+        ("quadrupole", "q: quadrupole, l = 0.3, k1 = 2.0", "d1, q, d1"),
+        ("bend with pole faces", BEND, "d1, b, d1"),
+        (
+            "bend with fint/hgap",
+            f"{BEND}, fint = 0.5, hgap = 0.03",
+            "d1, b, d1",
+        ),
+        ("solenoid", "s: solenoid, l = 0.3, ks = 0.4", "d1, s, d1"),
+        (
+            "chicane",
+            "bp: sbend, l = 0.5, angle = 0.1\nbm: sbend, l = 0.5, angle = -0.1",
+            "d1, bp, bm, d1, bm, bp, d1",
+        ),
+        (
+            "ten FODO cells",
+            "qf: quadrupole, l = 0.3, k1 = 2.0\nqd: quadrupole, l = 0.3, k1 = -2.0",
+            "10*(qf, d1, qd, d1)",
+        ),
+    ],
+)
+def test_linear_map_matches_tao(tao_with_beam, label, body, line):
+    from lume_impactx import ImpactXSimulator
+
+    tao = tao_with_beam(body, line)
+    simulator = ImpactXSimulator.from_tao(tao, nslice=32)
+    assert _map_difference(tao, simulator) < 1e-13, label
+
+
+def test_the_map_comparison_needs_the_basis_transform(tao_with_beam):
+    """Guard the transform itself: without it a bend looks 1.9e-1 wrong.
+
+    A test that silently dropped the similarity transform would still pass on a drift,
+    where the longitudinal block is nearly identity, and quietly stop testing bends.
+    """
+    import numpy as np
+
+    from lume_impactx import ImpactXSimulator
+
+    tao = tao_with_beam(BEND, "d1, b, d1")
+    simulator = ImpactXSimulator.from_tao(tao, nslice=32)
+
+    bmad = np.array(tao.matrix("BEGINNING", "END")["mat6"])
+    raw = np.asarray(simulator.results["transfer_map"])
+    untransformed = np.abs(bmad - raw).max() / np.abs(bmad).max()
+    assert untransformed > 1e-3
+    assert _map_difference(tao, simulator) < 1e-13
+
+
+# -- tracking: cases the parametrisation above does not reach --------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "body", "line", "tolerance"),
+    [
+        (
+            "sextupole, Bmad converged",
+            "s: sextupole, l = 0.2, k2 = 25.0, num_steps = 200",
+            "d1, s, d1",
+            1e-8,
+        ),
+        (
+            "octupole, Bmad converged",
+            "o: octupole, l = 0.15, k3 = 80.0, num_steps = 200",
+            "d1, o, d1",
+            1e-10,
+        ),
+        (
+            "hkicker and vkicker",
+            "hk: hkicker, kick = 1e-4\nvk: vkicker, kick = -7e-5",
+            "d1, hk, vk, d1",
+            1e-12,
+        ),
+        (
+            "misaligned quadrupole",
+            "q: quadrupole, l = 0.3, k1 = 2.0, x_offset = 1e-4, y_offset = -2e-4,"
+            " tilt = 0.05",
+            "d1, q, d1",
+            1e-12,
+        ),
+        (
+            "four-bend chicane",
+            "bp: sbend, l = 0.5, angle = 0.1\nbm: sbend, l = 0.5, angle = -0.1",
+            "d1, bp, bm, d1, bm, bp, d1",
+            1e-8,
+        ),
+        (
+            "ten FODO cells",
+            "qf: quadrupole, l = 0.3, k1 = 2.0\nqd: quadrupole, l = 0.3, k1 = -2.0",
+            "10*(qf, d1, qd, d1)",
+            1e-11,
+        ),
+    ],
+)
+def test_more_tracking_cases_match_bmad(track_both, label, body, line, tolerance):
+    worst = track_both(body, line)
+    assert 0.0 < worst < tolerance, f"{label}: {worst:.3e}"
+
+
+def test_a_collimator_loses_the_same_particles_as_bmad(tao_with_beam):
+    """Aperture physics, tested numerically rather than structurally.
+
+    ImpactX *drops* lost particles while Bmad keeps them with status != 1, so the Bmad
+    side must be filtered before the two are comparable at all.
+    """
+    import numpy as np
+
+    from lume_impactx import ImpactXSimulator
+
+    tao = tao_with_beam(
+        "c: ecollimator, l = 0.2, x_limit = 3e-4, y_limit = 3e-4\ndd: drift, l = 0.5",
+        "dd, c, dd",
+    )
+    simulator = ImpactXSimulator.from_tao(tao, nslice=8)
+
+    reference = tao.particles("END")
+    alive = reference.where(reference.status == 1)
+    survivors = simulator.final_particles
+
+    assert 0 < alive.n_particle < reference.n_particle, "the aperture must clip"
+    assert survivors.n_particle == alive.n_particle
+    assert (
+        np.abs(np.sort(survivors["x"]) - np.sort(alive["x"])).max()
+        / np.abs(alive["x"]).max()
+        < 1e-10
+    )
+
+
+# -- species -------------------------------------------------------------------------
+
+
+def test_the_lattice_species_is_readable_from_tao(tao_with_beam):
+    """A Bmad file that sets no parameter[particle] defaults to **positron**.
+
+    An earlier version of this translator documented that "Bmad exposes no
+    lattice-level species query through pytao" and took the species from the bunch
+    instead. That claim is false -- branch1 reports it -- and acting on it made an
+    electron bunch in a defaulted lattice track 100% away from Bmad, silently.
+    """
+    from lume_impactx.interfaces.bmad import lattice_species_from_tao
+
+    defaulted = tao_with_beam(
+        "q: quadrupole, l = 0.3, k1 = 2.0", "d1, q, d1", particle=None
+    )
+    assert lattice_species_from_tao(defaulted) == "positron"
+
+    explicit = tao_with_beam("q: quadrupole, l = 0.3, k1 = 2.0", "d1, q, d1")
+    assert lattice_species_from_tao(explicit) == "electron"
+
+
+def test_a_species_mismatch_is_refused(tmp_path, monkeypatch):
+    """Bmad normalises every magnet strength to the lattice species, so tracking a
+    different one through it is a setup this translator cannot reproduce -- measured
+    100% away from Bmad whichever species is chosen. Refuse rather than pick."""
+    import numpy as np
+    from beamphysics import ParticleGroup
+
+    from lume_impactx import ImpactXSimulator
+
+    directory = tmp_path / "mismatch"
+    directory.mkdir()
+    n = 32
+    rng = np.random.default_rng(7)
+    total_eV = 100e6
+    p0c = math.sqrt(total_eV**2 - ELECTRON_MASS_EV**2)
+    ParticleGroup(
+        data={
+            "x": rng.normal(0, 1e-4, n),
+            "y": rng.normal(0, 1e-4, n),
+            "z": np.zeros(n),
+            "px": rng.normal(0, 1e-5, n) * p0c,
+            "py": rng.normal(0, 1e-5, n) * p0c,
+            "pz": np.full(n, p0c),
+            "t": np.zeros(n),
+            "status": np.ones(n, dtype=int),
+            "weight": np.full(n, 1e-12),
+            "species": "electron",
+        }
+    ).write(str(directory / "beam.h5"))
+
+    # No parameter[particle], so Bmad defaults to positron.
+    (directory / "lat.bmad").write_text(
+        f"parameter[geometry] = open\nparameter[e_tot] = {total_eV}\n"
+        "beginning[beta_a] = 10\nbeginning[beta_b] = 10\n"
+        "q: quadrupole, l = 0.3, k1 = 2.0\nd1: drift, l = 0.4\n"
+        "lat: line = (d1, q, d1)\nuse, lat\n"
+    )
+    (directory / "tao.init").write_text(
+        '&tao_start\n/\n&tao_design_lattice\n  design_lattice(1)%file = "lat.bmad"\n/\n'
+        "&tao_beam_init\n  beam_init%position_file = 'beam.h5'\n"
+        f"  beam_init%n_particle = {n}\n"
+        "  beam_init%renorm_center = F\n  beam_init%renorm_sigma = F\n/\n"
+    )
+    monkeypatch.chdir(directory)
+    tao = pytao.Tao(init_file="tao.init", noplot=True)
+    tao.cmd("set global track_type = beam")
+    tao.cmd("set beam saved_at = *")
+
+    with pytest.raises(ValueError, match="defaults to positron"):
+        ImpactXSimulator.from_tao(tao, nslice=8)
+
+    # An explicit species overrides both the reference and the bunch's label, for
+    # anyone who knows the setup is consistent. It is not asserted to be *right* here:
+    # this lattice and beam genuinely disagree, which is the point of the refusal.
+    with pytest.warns(TaoTranslationWarning, match="Relabelling the bunch"):
+        ImpactXSimulator.from_tao(tao, nslice=8, species="positron")
+
+
+def test_a_zero_length_element_carrying_a_map_is_not_a_marker():
+    """taylor, match and patch carry a transfer map at zero length, so the marker
+    fallback would drop real physics -- measured 3.2e-1 for a taylor."""
+    from lume_impactx.interfaces.bmad import _MAP_AT_ZERO_LENGTH_KEYS, translate_element
+
+    for key in ("taylor", "match", "patch"):
+        assert key in _MAP_AT_ZERO_LENGTH_KEYS
+        with pytest.raises(UnsupportedElementError, match="carries a transfer map"):
+            translate_element({"key": key, "name": "X", "L": 0.0})
+
+    # A genuine marker is still a marker.
+    assert kinds(translate_element({"key": "marker", "name": "M", "L": 0.0})) == [
+        "Marker"
+    ]

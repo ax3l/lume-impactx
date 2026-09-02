@@ -55,6 +55,7 @@ __all__ = [
     "beam_from_tao",
     "capture_points_from_tao",
     "lattice_from_tao",
+    "lattice_species_from_tao",
     "model_from_tao",
     "particles_from_tao",
     "reference_from_tao",
@@ -109,8 +110,75 @@ def particles_from_tao(tao: Any, ele: str = "BEGINNING") -> ParticleGroup:
         ) from exc
 
 
+def lattice_species_from_tao(tao: Any, branch: int = 0) -> str | None:
+    """The species the *lattice* is built for, as an openPMD-beamphysics name.
+
+    This is what Bmad tracks, and what every magnet strength in the lattice is
+    normalised to. It is not necessarily what a bunch calls itself: ``tao.particles()``
+    takes its species from the beam file's own metadata, so loading an electron file
+    into a positron lattice yields a bunch labelled ``electron`` that Bmad nonetheless
+    tracks as a positron.
+
+    Returns ``None`` when Tao will not answer, so callers can fall back rather than
+    fail.
+    """
+    try:
+        # Universes are 1-based, branches 0-based.
+        value = dict(tao.branch1(1, branch)).get("param_particle")
+    except Exception:  # pragma: no cover - depends on the pytao build
+        return None
+    return str(value).lower() if value else None
+
+
+def _species_for(tao: Any, ele: str, branch: int = 0) -> str:
+    """Reconcile the lattice's species with the bunch's own label.
+
+    The lattice wins. A Bmad file that sets no ``parameter[particle]`` defaults to
+    **positron**, so feeding it an electron bunch flips the sign of every bend,
+    quadrupole and kicker relative to what Bmad tracked -- measured 100% wrong, and
+    previously silent, because the translator took the species from the bunch.
+    """
+    from_lattice = lattice_species_from_tao(tao, branch)
+    try:
+        from_bunch = str(particles_from_tao(tao, ele).species)
+    except Exception:  # pragma: no cover - no tracked beam
+        from_bunch = None
+
+    if from_lattice is None:
+        if from_bunch is None:
+            raise ValueError(
+                "Could not determine the species from either the lattice or the bunch."
+            )
+        _warn(
+            "Tao would not report the lattice species; using the bunch's label "
+            f"{from_bunch!r}. If the lattice is for another species, every magnet "
+            "strength is normalised to it and the translation will be wrong."
+        )
+        return from_bunch
+
+    if from_bunch is not None and from_bunch.lower() != from_lattice.lower():
+        # Refuse rather than pick one. Bmad tracks the bunch's species through a lattice
+        # whose magnet strengths are normalised to *its* species, and the translation
+        # reproduces neither: measured 100% wrong against Bmad with either choice. A
+        # Bmad file that sets no parameter[particle] defaults to positron, so this is
+        # easy to hit by accident with an electron beam and no warning at all before.
+        raise ValueError(
+            f"The bunch is {from_bunch!r} but the lattice is for {from_lattice!r}. "
+            "Bmad normalises every magnet strength to the lattice species, so tracking "
+            "a different one through it is a setup this translator cannot reproduce -- "
+            "measured 100% away from Bmad whichever species is used. Note a Bmad file "
+            "that sets no parameter[particle] defaults to positron. Set "
+            "parameter[particle] to match the beam, or pass species= explicitly if you "
+            "know the two are consistent."
+        )
+    return from_lattice
+
+
 def reference_from_tao(
-    tao: Any, ele: str = "BEGINNING", species: str | None = None
+    tao: Any,
+    ele: str = "BEGINNING",
+    species: str | None = None,
+    branch: int = 0,
 ) -> dict[str, Any]:
     """Build the reference-particle specification for :class:`ImpactXSimulator`.
 
@@ -126,8 +194,11 @@ def reference_from_tao(
     ele : str
         Element to take the reference at.
     species : str, optional
-        openPMD-beamphysics species name. Taken from the tracked bunch when omitted,
-        since Bmad exposes no lattice-level species query through pytao.
+        openPMD-beamphysics species name. Taken from the *lattice* when omitted -- what
+        Bmad actually tracked -- not from the bunch's own label. See
+        :func:`lattice_species_from_tao`.
+    branch : int
+        Lattice branch the species is read from.
 
     Returns
     -------
@@ -135,7 +206,7 @@ def reference_from_tao(
         ``{"species": ..., "kin_energy_MeV": ...}``, ready to pass as ``ref=``.
     """
     if species is None:
-        species = str(particles_from_tao(tao, ele).species)
+        species = _species_for(tao, ele, branch)
 
     total_energy_eV = float(tao.ele_gen_attribs(ele)["E_TOT"])
     rest_mass_eV = mass_of(species)
@@ -149,15 +220,29 @@ def reference_from_tao(
 
 
 def beam_from_tao(
-    tao: Any, ele: str = "BEGINNING", species: str | None = None
+    tao: Any,
+    ele: str = "BEGINNING",
+    species: str | None = None,
+    branch: int = 0,
 ) -> tuple[dict[str, Any], ParticleGroup]:
     """Return ``(reference_spec, particles)`` for one element.
 
     Convenience wrapper over :func:`reference_from_tao` and :func:`particles_from_tao`
     that reads the bunch once.
+
     """
     particles = particles_from_tao(tao, ele)
-    reference = reference_from_tao(tao, ele, species=species or str(particles.species))
+    reference = reference_from_tao(tao, ele, species=species, branch=branch)
+    if species is not None and str(particles.species).lower() != str(species).lower():
+        # An explicit species overrides both halves. Without this it would set the
+        # reference and leave the bunch's own label alone, and the injection check
+        # downstream would reject the pair -- an override that cannot actually be used.
+        _warn(
+            f"Relabelling the bunch from {particles.species!r} to {species!r}, as "
+            "asked. Bmad tracked it as the lattice species, so check that is what you "
+            "meant."
+        )
+        particles.species = species
     return reference, particles
 
 
@@ -186,6 +271,13 @@ _CAPTURE_KEYS = frozenset({"marker", "beginning_ele", "monitor", "instrument"})
 #: Bmad elements that carry no length and no effect on the beam.
 MARKER_LIKE_KEYS = frozenset(
     {"marker", "beginning_ele", "fork", "photon_fork", "fiducial", "null_ele"}
+)
+
+#: Zero-length elements that still carry a transfer map. The zero-length fallback
+#: below turns an unknown element into a marker, which is right for a genuine marker
+#: and wrong for these: a taylor element measured 3.2e-1 away from Bmad that way.
+_MAP_AT_ZERO_LENGTH_KEYS = frozenset(
+    {"taylor", "match", "patch", "ab_multipole", "multipole", "sad_mult"}
 )
 
 #: Structural elements that describe control relationships, not beam optics. Bmad
@@ -964,6 +1056,14 @@ def translate_element(
             "ImpactX equivalent."
         )
 
+    if key in _MAP_AT_ZERO_LENGTH_KEYS:
+        raise UnsupportedElementError(
+            f"{name}: Bmad element type {key!r} carries a transfer map even at zero "
+            "length, so replacing it with a marker would silently drop real physics -- "
+            "measured 3.2e-1 away from Bmad for a taylor element. Pass "
+            "skip_unsupported=True to accept a marker anyway."
+        )
+
     _warn(
         f"{name}: Bmad element type {key!r} is not translated; it has zero length, so "
         "it is replaced by a marker."
@@ -1423,7 +1523,7 @@ def simulator_from_tao(
         if capture and lattice is None
         else []
     )
-    reference, particles = beam_from_tao(tao, ele, species=species)
+    reference, particles = beam_from_tao(tao, ele, species=species, branch=branch)
     if lattice is None:
         lattice = lattice_from_tao(
             tao,
