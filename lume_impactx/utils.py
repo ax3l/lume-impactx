@@ -27,9 +27,9 @@ Two asymmetries in the ImpactX API bite here, both verified against 26.08:
   as, **1/eV** (-1.9570e-6 for electrons) and stores that value verbatim. But
   ``ImpactX.add_particles()`` -- the distribution path -- stores **SI, C/kg**
   (-1.7588e11). So ``to_df()["qm"]`` reports whichever unit the particles were inserted
-  with. The two differ by ``c**2``. Both verified against 26.08; worth reporting
-  upstream. Consequently the readers here **never trust** ``qm``: species comes from the
-  reference particle instead.
+  with. The two differ by ``c**2``. Both verified against 26.08, and worked around here
+  rather than upstream: the readers **never trust** ``qm`` at all, taking the species
+  from the reference particle instead, which is correct under either convention.
 * ``t`` is seconds in ``ParticleGroup`` but ``c * t`` in metres in ImpactX.
 
 Spin and other per-particle records

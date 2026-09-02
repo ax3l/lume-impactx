@@ -529,3 +529,51 @@ def test_a_bunch_at_element_variable_reads_a_capture(fodo_simulator):
     assert variable._get(fodo_simulator)["sigma_x"] == pytest.approx(
         fodo_simulator.final_particles["sigma_x"]
     )
+
+
+def test_a_user_hook_coexists_with_capture(fodo_lattice, waterbag):
+    """ImpactX holds ONE callback per hook event -- src/python/ImpactX.cpp:72 is a
+    std::unordered_map<std::string, std::function<void(ImpactX*)>> -- so claiming
+    "after_element" for captures would lock the user out of it. Both must run."""
+    from lume_impactx.simulator import ImpactXSimulator
+
+    seen: list[str] = []
+    simulator = ImpactXSimulator(
+        lattice=fodo_lattice,
+        ref={"species": "electron", "kin_energy_MeV": KIN_ENERGY_MEV},
+        distribution=waterbag,
+        npart=200,
+        bunch_charge_C=BUNCH_CHARGE_C,
+        capture_at=["quad1"],
+        track_on_init=False,
+    )
+    simulator.hooks = {
+        "after_element": [
+            lambda sim: seen.append(str(getattr(sim.tracking_element, "name", "")))
+        ]
+    }
+    simulator.track()
+
+    assert "quad1" in simulator.particles  # capture still ran
+    assert seen == ["drift1", "quad1", "drift2", "quad2", "drift3"]  # and so did theirs
+
+
+def test_several_user_hooks_on_one_event_all_run(fodo_lattice, waterbag):
+    """Chained into one dispatcher rather than silently overwriting each other."""
+    from lume_impactx.simulator import ImpactXSimulator
+
+    calls: list[int] = []
+    simulator = ImpactXSimulator(
+        lattice=fodo_lattice,
+        ref={"species": "electron", "kin_energy_MeV": KIN_ENERGY_MEV},
+        distribution=waterbag,
+        npart=200,
+        bunch_charge_C=BUNCH_CHARGE_C,
+        track_on_init=False,
+    )
+    simulator.hooks = {
+        "before_element": [lambda sim: calls.append(1), lambda sim: calls.append(2)]
+    }
+    simulator.track()
+    assert calls.count(1) == len(fodo_lattice)
+    assert calls.count(2) == len(fodo_lattice)

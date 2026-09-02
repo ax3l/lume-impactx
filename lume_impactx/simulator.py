@@ -335,6 +335,9 @@ class ImpactXSimulator:
         self.initial_particles = initial_particles
         self.capture_at = list(capture_at or [])
         self.groups: dict[str, list[str]] = dict(groups or {})
+        #: Extra tracking callbacks by ImpactX hook name, e.g.
+        #: ``{"after_element": [my_probe]}``. See :meth:`_install_hooks`.
+        self.hooks: dict[str, list[Any]] = {}
         self.ref_origin = ref_origin
         self.settings = {**_DEFAULT_SETTINGS, **(settings or {})}
 
@@ -613,7 +616,13 @@ class ImpactXSimulator:
         """
         captured: dict[str, Any] = {}
         capture_at = getattr(self, "capture_at", None)
+        user_hooks = {
+            event: list(callbacks)
+            for event, callbacks in (getattr(self, "hooks", None) or {}).items()
+            if callbacks
+        }
         if not capture_at:
+            self._install_user_hooks(sim, user_hooks)
             return captured
         # Matched case-insensitively, because the lookup side is: taking a name from a
         # Tao lattice and getting nothing back was silent before.
@@ -639,11 +648,45 @@ class ImpactXSimulator:
             captured[label] = self._snapshot_particles(instance.beam)
             self._captured_names.add(name.lower())
 
+        # ImpactX's hook map holds exactly ONE callback per event --
+        # std::unordered_map<std::string, std::function<void(ImpactX*)>> in
+        # src/python/ImpactX.cpp:72 -- so claiming "after_element" for captures would
+        # otherwise lock a user out of it entirely. Capture runs first, then anything in
+        # self.hooks, through a single registered dispatcher.
+        others = user_hooks.pop("after_element", [])
+
+        def dispatch(instance) -> None:
+            after_element(instance)
+            for callback in others:
+                callback(instance)
+
         # No reference is kept to this callback on purpose: pybind's std::function
         # caster holds a counted reference, verified by dropping every Python-side name
         # and forcing a collection -- the hook still fires.
-        sim.hook["after_element"] = after_element
+        sim.hook["after_element"] = dispatch
+        self._install_user_hooks(sim, user_hooks)
         return captured
+
+    @staticmethod
+    def _install_user_hooks(sim, user_hooks: dict[str, list]) -> None:
+        """Register the caller's own tracking callbacks.
+
+        ImpactX allows one callback per event, so several are chained into one
+        dispatcher here rather than silently overwriting each other. Events ImpactX
+        knows are ``before_period``, ``after_period``, ``before_element``,
+        ``after_element`` and ``before_slice``; an unknown name is left to ImpactX to
+        reject rather than second-guessed here.
+        """
+        for event, callbacks in user_hooks.items():
+            if not callbacks:
+                continue
+            chain = list(callbacks)
+
+            def dispatch(instance, _chain=chain) -> None:
+                for callback in _chain:
+                    callback(instance)
+
+            sim.hook[event] = dispatch
 
     def run(self) -> dict[str, Any]:
         """Run the simulation. An alias for :meth:`track`.
