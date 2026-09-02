@@ -192,6 +192,94 @@ def test_beam_monitor_reader_matches_the_in_memory_bunch(tmp_path, monkeypatch):
     for stat in ["sigma_x", "sigma_y", "norm_emit_x", "mean_energy"]:
         assert from_file[stat] == pytest.approx(in_memory[stat], rel=1e-12), stat
     assert from_file.charge == pytest.approx(in_memory.charge, rel=1e-12)
+    # Everything that reached the monitor is alive, and ids carry across.
+    assert from_file.n_alive == from_file.n_particle
+    assert len(np.unique(from_file.id)) == from_file.n_particle
+
+
+@pytest.mark.slow
+def test_lost_particles_are_not_reported_as_alive(tmp_path, monkeypatch):
+    """A particles_lost file holds only lost particles, whatever AMReX' bits say.
+
+    They are valid *entries of that container*, so the validity bit reads True for all
+    of them; taking it at face value reported a bunch that was entirely alive. The
+    zeroed reference particle is the signature of that file.
+
+    openPMD-beamphysics has no "lost" status -- ParticleGroup splits on `status == 1`
+    and each interface passes its own code through (Bmad its state, Astra its loss
+    codes) -- so this asserts the split, not a particular integer. It must not be 0,
+    which is CATHODE and which the Astra writer turns back into "at the cathode".
+    """
+    from impactx import ImpactX, distribution, elements
+
+    from lume_impactx.utils import (
+        PARTICLE_STATUS_LOST,
+        read_beam_monitor,
+        refpart_from_openpmd,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    sim = ImpactX()
+    sim.verbose = 0
+    sim.tiny_profiler = False
+    sim.space_charge = False
+    sim.diagnostics = True
+    sim.slice_step_diagnostics = False
+    sim.init_grids()
+    sim.beam.ref.set_species("electron").set_kin_energy_MeV(100.0)
+    sim.add_particles(
+        1e-9,
+        distribution.Waterbag(
+            lambdaX=3e-4,
+            lambdaY=3e-4,
+            lambdaT=1e-4,
+            lambdaPx=2e-5,
+            lambdaPy=2e-5,
+            lambdaPt=1e-4,
+        ),
+        1000,
+    )
+    monitor = elements.BeamMonitor("mon", backend="h5")
+    sim.lattice.extend(
+        [
+            monitor,
+            elements.ExactDrift(name="dr", ds=0.5, nslice=4),
+            elements.Aperture(
+                name="ap", aperture_x=3e-4, aperture_y=3e-4, shape="rectangular"
+            ),
+            monitor,
+        ]
+    )
+    sim.track_particles()
+    sim.finalize()
+
+    opmd = tmp_path / "diags" / "openPMD"
+    kept = read_beam_monitor(str(opmd / "mon.h5"))
+    assert kept.n_alive == kept.n_particle
+
+    lost_files = [p for p in opmd.iterdir() if p.name.startswith("particles_lost")]
+    assert lost_files, f"no particles_lost output in {sorted(p.name for p in opmd)}"
+
+    # The lost file needs the monitor's reference particle; its own is zeroed.
+    import openpmd_api as io
+
+    series = io.Series(str(opmd / "mon.h5"), io.Access.read_only)
+    reference = refpart_from_openpmd(
+        series.iterations[list(series.iterations)[-1]].particles["beam"]
+    )
+    series.close()
+
+    lost = read_beam_monitor(str(lost_files[0]), ref=reference, strict=False)
+    assert lost.n_particle > 0
+    assert lost.n_alive == 0, "every particle in a particles_lost file is lost"
+    assert lost.n_dead == lost.n_particle
+    assert (lost.status == PARTICLE_STATUS_LOST).all()
+    assert PARTICLE_STATUS_LOST != 0, "0 is CATHODE, not lost"
+
+    # Nothing is double counted, and ids stay unique across the two files.
+    assert kept.n_particle + lost.n_particle == 1000
+    both = np.concatenate([kept.id, lost.id])
+    assert len(np.unique(both)) == both.size
 
 
 @pytest.mark.slow

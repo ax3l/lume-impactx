@@ -88,6 +88,7 @@ __all__ = [
     "ImpactXRefPart",
     "particlegroup_to_impactx",
     "impactx_to_particlegroup_data",
+    "PARTICLE_STATUS_LOST",
     "particle_id_from_idcpu",
     "refpart_snapshot",
     "apply_refpart",
@@ -688,7 +689,9 @@ def particle_container_to_particlegroup(
     if "idcpu" in data:
         ids, valid = particle_id_from_idcpu(data["idcpu"])
         data["id"] = ids
-        data["status"] = np.where(valid, int(ParticleStatus.ALIVE), 0)
+        data["status"] = np.where(
+            valid, int(ParticleStatus.ALIVE), PARTICLE_STATUS_LOST
+        )
     return ParticleGroup(
         data=impactx_to_particlegroup_data(data, snapshot, species=species)
     )
@@ -737,6 +740,19 @@ _EMPTY_PLACEHOLDER_RECORD = "empty"
 # -- only the packed value is globally unique, and that is what becomes the
 # ``ParticleGroup`` id.
 _AMREX_VALID_BIT = np.uint64(1) << np.uint64(63)
+
+#: ``status`` for a particle ImpactX has lost.
+#:
+#: openPMD-beamphysics defines only ``CATHODE = 0`` and ``ALIVE = 1``; ``ParticleGroup``
+#: counts ``status == 1`` as alive and everything else as dead, and each interface
+#: passes its *source code's* own code through -- Bmad its ``state`` (3..6 for the loss
+#: direction), Astra its loss codes. There is no generic "lost" value to use.
+#:
+#: So this is a choice, and the one value it must not be is ``0``: that is CATHODE, a
+#: positive claim that the particle is sitting at the source, and
+#: ``beamphysics.interfaces.astra`` writes ``status == 0`` back out as Astra's -1, "at
+#: the cathode". 2 is outside Bmad's loss range and reads as merely "not alive".
+PARTICLE_STATUS_LOST = 2
 
 
 def particle_id_from_idcpu(idcpu) -> tuple[np.ndarray, np.ndarray]:
@@ -927,6 +943,12 @@ def read_beam_monitor_data(
     finally:
         series.close()
 
+    # Every particle in a particles_lost file is lost by construction, whatever AMReX'
+    # validity bit says -- they are valid *entries of that container*, so the bit reads
+    # True for all of them and the bunch would otherwise claim to be entirely alive.
+    # The zeroed reference particle is the reliable signature of that file.
+    from_lost_file = not _reference_is_physical(file_ref)
+
     if ref is None:
         ref = file_ref
         if not _reference_is_physical(ref):
@@ -943,9 +965,12 @@ def read_beam_monitor_data(
         _check_representable(extras)
 
     data["id"] = ids
-    # openPMD-beamphysics reads status == 1 as alive and anything else as not alive;
-    # there is no enum member for "lost", so a plain 0 it is.
-    data["status"] = np.where(valid, int(ParticleStatus.ALIVE), 0)
+    if from_lost_file:
+        data["status"] = np.full(ids.shape, PARTICLE_STATUS_LOST)
+    else:
+        data["status"] = np.where(
+            valid, int(ParticleStatus.ALIVE), PARTICLE_STATUS_LOST
+        )
 
     return impactx_to_particlegroup_data(data, ref, species=species)
 
@@ -992,6 +1017,13 @@ def read_beam_monitor(
         In z-coordinates: every ``z`` is zero, the bunch length is a spread in ``t``,
         and the transverse coordinates are relative to the reference particle. See the
         module docstring for the frame conventions.
+
+        ``status`` follows openPMD-beamphysics, where ``1`` is alive and anything else
+        is not: ``pg.n_alive`` and ``pg.n_dead`` split on exactly that. Reading a
+        ``particles_lost`` file marks every particle :data:`PARTICLE_STATUS_LOST`,
+        because they are all lost by construction -- AMReX' validity bit is True for all
+        of them, since they are valid *entries of that container*, and taking it at face
+        value would report a bunch that is entirely alive.
 
     Raises
     ------
