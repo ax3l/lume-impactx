@@ -112,7 +112,9 @@ def make_tao(tmp_path, monkeypatch):
             f"parameter[particle] = {particle}\n"
             f"parameter[e_tot] = {e_tot}\n"
             f"beginning[beta_a] = 10\nbeginning[beta_b] = 10\n"
-            f"{body}\nlat: line = ({line})\nuse, lat\n"
+            # d1 is predefined in all three lattice fixtures, so a case can move
+            # between them without redefining its drift.
+            f"d1: drift, l = 0.4\n{body}\nlat: line = ({line})\nuse, lat\n"
         )
         (directory / "tao.init").write_text(
             "&tao_start\n/\n&tao_design_lattice\n"
@@ -484,10 +486,33 @@ def test_an_unsupported_element_raises_and_can_be_skipped(make_tao):
 
 
 def test_a_skipped_zero_length_element_is_still_a_marker(make_tao):
-    tao = make_tao("p: patch, tilt = 0.1", "p")
+    tao = make_tao("t: taylor, {2: 0.5 | 5}", "t")
     with pytest.warns(TaoTranslationWarning, match="Replaced by a marker"):
         lattice = lattice_from_tao(tao, skip_unsupported=True)
     assert kinds(lattice) == ["Marker", "Marker", "Marker"]
+
+
+def test_a_patch_that_only_tilts_the_frame_is_exact(make_tao):
+    """LCLS cu_hxr's RODMP1H and RODMP2H are exactly this: zero length, a 10 degree
+    tilt, nothing else. ImpactX's PlaneXYRot is the same rotation, negated because Bmad
+    turns the frame while ImpactX turns the coordinates."""
+    tao = make_tao("p: patch, tilt = 0.174519678252", "d1, p, d1")
+    lattice = lattice_from_tao(tao)
+    assert kinds(lattice) == [
+        "Marker",
+        "ExactDrift",
+        "PlaneXYRot",
+        "ExactDrift",
+        "Marker",
+    ]
+    # to_dict reports radians where the constructor takes degrees
+    assert lattice[2].to_dict()["angle"] == pytest.approx(-0.174519678252)
+
+
+def test_a_patch_that_displaces_the_frame_is_refused(make_tao):
+    tao = make_tao("p: patch, x_offset = 1e-3", "d1, p, d1")
+    with pytest.raises(UnsupportedElementError, match="displaces or re-times"):
+        lattice_from_tao(tao)
 
 
 def test_a_zeroed_thin_multipole_is_not_an_error(make_tao):
@@ -790,6 +815,12 @@ def track_both(tmp_path, monkeypatch):
             "q: quadrupole, l = 0.3, k1 = 2.0",
             "d1, c, q, d1",
             1e-6,
+        ),
+        (
+            "patch that tilts the frame",
+            "p: patch, tilt = 0.174519678252",
+            "d1, p, d1",
+            1e-12,
         ),
         (
             "lcavity followed by a quadrupole",
@@ -1401,7 +1432,9 @@ def test_a_zero_length_element_carrying_a_map_is_not_a_marker():
     fallback would drop real physics -- measured 3.2e-1 for a taylor."""
     from lume_impactx.interfaces.bmad import _MAP_AT_ZERO_LENGTH_KEYS, translate_element
 
-    for key in ("taylor", "match", "patch"):
+    # patch is not in this list any more: one that only tilts the frame translates
+    # exactly, and only a displacing one is refused. See the patch tests above.
+    for key in ("taylor", "match"):
         assert key in _MAP_AT_ZERO_LENGTH_KEYS
         with pytest.raises(UnsupportedElementError, match="carries a transfer map"):
             translate_element({"key": key, "name": "X", "L": 0.0})

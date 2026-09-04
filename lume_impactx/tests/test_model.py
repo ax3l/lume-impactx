@@ -719,3 +719,61 @@ def test_screen_actions_register_on_a_model(screened_simulator):
 
     assert model.get("OTR1:image").shape == (32, 32)
     assert model.get("OTR1:resolution") == pytest.approx(40e-6)
+
+
+# -- the tutorial's virtual accelerator ------------------------------------------------
+
+
+def test_a_fodo_with_a_screen_behaves_like_a_virtual_accelerator(
+    fodo_lattice, waterbag
+):
+    """The workflow LUME's own tutorial builds with Cheetah, done with ImpactX.
+
+    Its "Simple Virtual Accelerator" defines a FODO with a screen at the end, exposes
+    the quadrupole strengths and the screen image as variables, then scans a quadrupole
+    and watches the spot change. That is the whole user-facing story end to end -- a
+    lattice, a model, get/set, and an image -- so it is worth one test that fails if any
+    link in it breaks, however green the unit tests are.
+    """
+    from impactx import elements as impactx_elements
+
+    from lume_impactx.actions import ScreenSpec, screen_actions
+    from lume_impactx.model import LUMEImpactXModel
+    from lume_impactx.simulator import ImpactXSimulator
+
+    lattice = list(fodo_lattice) + [impactx_elements.Marker(name="screen")]
+    simulator = ImpactXSimulator(
+        lattice=lattice,
+        ref={"species": "electron", "kin_energy_MeV": KIN_ENERGY_MEV},
+        distribution=waterbag,
+        npart=2000,
+        bunch_charge_C=BUNCH_CHARGE_C,
+        capture_at=["screen"],
+    )
+    model = LUMEImpactXModel.from_simulator(simulator)
+    for action in screen_actions(ScreenSpec("screen", (100, 100), 20e-6)):
+        model.register_action_variable(action)
+
+    # The quadrupole strengths are generated, the screen was registered.
+    assert "ele:quad1:k" in model.supported_variables
+    assert "screen:image" in model.supported_variables
+
+    images = []
+    widths = []
+    for strength in (0.5, 1.0, 1.5):
+        model.set({"ele:quad1:k": strength})
+        images.append(model.get("screen:image"))
+        widths.append(model.get("moment_final:sigma_x"))
+
+    for image in images:
+        assert image.shape == (100, 100)
+        assert image.max() == pytest.approx(1.0)
+        assert image.sum() > 0, "the beam has to land on the screen"
+
+    # Scanning a quadrupole must actually move the spot, or the loop proves nothing.
+    assert len({round(w, 12) for w in widths}) == 3
+    assert not np.allclose(images[0], images[-1])
+
+    # And the model still restores.
+    model.reset()
+    assert model.get("ele:quad1:k") == pytest.approx(1.0)

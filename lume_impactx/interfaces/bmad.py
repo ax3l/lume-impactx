@@ -1075,6 +1075,39 @@ def translate_element(
             "ImpactX equivalent."
         )
 
+    if key == "patch":
+        # A patch that only rolls the frame is exactly ImpactX's PlaneXYRot -- "a simple
+        # rotation in the plane transverse to the velocity of the reference particle".
+        # The sign is negated: Bmad rotates the *frame*, so the coordinates turn the
+        # other way. Verified against Bmad at 5.6e-16, where the unnegated angle is
+        # 3.7e-1 out and no rotation at all is 1.6e-1.
+        #
+        # LCLS cu_hxr's two patches, RODMP1H and RODMP2H, are exactly this: zero length,
+        # a 10 degree tilt, nothing else.
+        moved = {
+            attribute: _get(info, attribute)
+            for attribute in (
+                "X_OFFSET",
+                "Y_OFFSET",
+                "Z_OFFSET",
+                "X_PITCH",
+                "Y_PITCH",
+                "E_TOT_OFFSET",
+                "T_OFFSET",
+            )  # fmt: skip
+            if _get(info, attribute) != 0.0
+        }
+        tilt = _get(info, "TILT")
+        if not moved and length == 0.0:
+            if tilt == 0.0:
+                return wrap([elements.Marker(name=name or key)])
+            return wrap([elements.PlaneXYRot(name=name, angle=-math.degrees(tilt))])
+        raise UnsupportedElementError(
+            f"{name}: Bmad patch displaces or re-times the reference frame "
+            f"({moved or f'length {length} m'}), which ImpactX has no element for. A "
+            "patch that only tilts the frame is translated exactly."
+        )
+
     if key in ("multipole", "ab_multipole") and not _has_multipole_content(info):
         # A corrector set to zero. Every SLAC lattice carries these -- cu_hxr's SQ01 and
         # CQ01 both have an empty multipole table -- and refusing them would mean no
