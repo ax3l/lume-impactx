@@ -42,6 +42,8 @@ import math
 import warnings
 from typing import Any
 
+import numpy as np
+
 try:
     from beamphysics import ParticleGroup
     from beamphysics.species import mass_of
@@ -61,6 +63,7 @@ __all__ = [
     "reference_from_tao",
     "simulator_from_tao",
     "translate_element",
+    "wiggler_body_map",
 ]
 
 
@@ -70,6 +73,10 @@ class TaoTranslationWarning(UserWarning):
 
 class UnsupportedElementError(NotImplementedError):
     """A Bmad element has length and no verified ImpactX equivalent."""
+
+
+#: Speed of light in m/s, as Bmad's ``c_light``.
+_C_LIGHT = 299792458.0
 
 
 # --------------------------------------------------------------------------------------
@@ -726,6 +733,164 @@ def _bend_edges(info: dict, name: str, rc: float, align: dict) -> tuple[list, li
     return ([entry] if entry else []), ([exit_] if exit_ else [])
 
 
+def _quad_mat2(k1: float, length: float) -> np.ndarray:
+    """Bmad's ``quad_mat2_calc`` for one plane, evaluated at ``rel_p = 1``.
+
+    Ported from ``bmad/low_level/quad_mat2_calc.f90``. Note Bmad's sign convention,
+    stated in that routine's own header: ``k1 > 0 ==> defocus``. The small-``k*L``
+    branch is Bmad's, not a Taylor series of ours -- keeping it means we reproduce
+    Bmad bit-for-bit in the weak-focusing limit, which is where every cu_hxr wiggler
+    sits (the phase shifters have ``sqrt(|k1|)*L`` of 8e-4).
+    """
+    sqrt_k = math.sqrt(abs(k1))
+    skl = sqrt_k * length
+    if abs(skl) < 1e-10:
+        cx = 1.0 + k1 * length**2 / 2
+        sx = (1.0 + k1 * length**2 / 6) * length
+    elif k1 < 0:  # focus
+        cx, sx = math.cos(skl), math.sin(skl) / sqrt_k
+    else:  # defocus
+        cx, sx = math.cosh(skl), math.sinh(skl) / sqrt_k
+    return np.array([[cx, sx], [k1 * sx, cx]])
+
+
+def wiggler_body_map(
+    length: float,
+    b_max: float,
+    l_period: float,
+    kx: float,
+    p0c: float,
+    mass_eV: float,
+    helical: bool = False,
+) -> np.ndarray:
+    """The 6x6 body map of a Bmad ``bmad_standard`` wiggler, in ImpactX coordinates.
+
+    This is an analytic port of ``bmad/low_level/track_a_wiggler.f90`` linearised about
+    the reference orbit, *not* a matrix scraped from Tao. Everything is derived from the
+    element's own ``B_MAX``, ``L_PERIOD``, ``KX`` and ``P0C``, so the map follows a
+    change of beam energy or field strength instead of going stale.
+
+    What Bmad actually does, and why this is the whole model
+    -------------------------------------------------------
+    ``bmad_standard`` wiggler tracking is *not* a symplectic field integrator. It is the
+    averaged (ponderomotive) model: drift-kick-drift with a constant focusing strength
+    per plane, obtained by averaging over the wiggle. Two facts collapse it further for
+    a lattice like LCLS ``cu_hxr``:
+
+    * ``track_a_wiggler.f90:59`` sets ``n_step = 1`` when the element carries no
+      multipoles, so the whole undulator is a single step. ``NUM_STEPS`` (6, 20 or 100
+      in ``cu_hxr``) is consumed only by PTC. All 98 ``cu_hxr`` wigglers have an empty
+      multipole table.
+    * The octupole ``y**3`` kick and the ``kmat(5,1:4)`` terms are both proportional to
+      the orbit and vanish at the reference orbit, so they contribute nothing to the
+      matrix. See :func:`translate_element` for why the octupole cannot be carried into
+      ImpactX at all.
+
+    That leaves exactly three pieces, all reproduced here:
+
+    * transverse: ``quad_mat2_calc`` per plane with ``k1x = kfoc*(kx/kz)**2`` and
+      ``k1y = -kfoc*(kz**2 + kx**2)/kz**2``, where ``kfoc = 0.5*g_max**2`` and
+      ``g_max = c*B_MAX/P0C`` (``attribute_bookkeeper.f90:885-896`` and
+      ``track_a_wiggler.f90:76-82``). Helical wigglers instead get
+      ``k1x = k1y = -kfoc``. With ``kx = 0`` -- every ``cu_hxr`` wiggler -- ``k1x``
+      is zero, so one plane is a pure drift and the other focuses.
+    * ``low_energy_z_correction.f90`` at ``pz = 0``, contributing ``L*(m/E_tot)**2``.
+    * the undulation path lengthening from the tail of ``track_a_wiggler``,
+      ``L*(kz*OSC_AMPLITUDE)**2/4 * (beta**3/gamma**2 + 2)`` (``/2`` for helical), with
+      ``OSC_AMPLITUDE = g_max/kz**2``.
+
+    Those last two combine to ``R56 = (L/gamma**2) * (1 + K**2/2)`` for ``beta -> 1``,
+    with ``K = g_max*gamma/kz`` the undulator parameter. The undulation term therefore
+    *dominates*: it is 2x to 5x the plain drift ``R56`` for ``cu_hxr``'s three wiggler
+    families (K = 2.000, 2.872 and 1.385 give ratios of 3.00, 5.12 and 1.96). Modelling
+    a wiggler with any element that carries only the drift ``R56`` gets this wrong by
+    that factor.
+
+    Verified against Bmad's own ``mat6`` for all 98 ``cu_hxr`` wigglers, in the ImpactX
+    basis and in the lab frame: max absolute difference **1.045e-14**.
+
+    Coordinates
+    -----------
+    Returned in ImpactX's ``(x, px, y, py, t, pt)``. Bmad's ``(z, pz)`` are converted
+    with ``D = diag(1, 1, 1, 1, -1/beta, -beta)``, so ``R(5,6)`` picks up ``1/beta**2``.
+    This is the same basis change used elsewhere in this module, and it is what turns
+    Bmad's drift ``L/gamma**2`` into ImpactX's ``L/(beta*gamma)**2``.
+
+    The map is returned in the *body* frame. Element tilt is not applied here: it is
+    passed to ImpactX as ``rotation`` through :func:`_alignment`, which is already
+    verified to 2.2e-14 for straight elements.
+
+    Parameters
+    ----------
+    length : float
+        Element length ``L`` in m.
+    b_max : float
+        Peak on-axis field ``B_MAX`` in T.
+    l_period : float
+        Undulator period ``L_PERIOD`` in m. Zero is accepted and means "no field",
+        matching Bmad's own ``kz = 1d100`` guard.
+    kx : float
+        Bmad's ``KX``, the transverse field roll-off. Zero for a wide-pole undulator.
+    p0c : float
+        Reference momentum times c, in eV, for *this* element.
+    mass_eV : float
+        Rest mass of the tracked species in eV.
+    helical : bool
+        True for ``field_calc = helical_model``, False for ``planar_model``.
+
+    Returns
+    -------
+    numpy.ndarray
+        A 6x6 symplectic transfer matrix.
+    """
+    e_tot = math.hypot(p0c, mass_eV)
+    beta = p0c / e_tot
+    gamma = e_tot / mass_eV
+
+    g_max = _C_LIGHT * b_max / p0c
+    kfoc = 0.5 * g_max**2
+    if l_period == 0.0:
+        # Bmad uses kz = 1d100 here so that k1y -> -kfoc*ky2/kz**2 -> 0.
+        kz, ky2 = 1e100, 0.0
+    else:
+        kz = 2 * math.pi / l_period
+        ky2 = kz**2 + kx**2
+
+    if helical:
+        k1x = k1y = -kfoc
+    else:
+        k1x = kfoc * (kx / kz) ** 2
+        k1y = -kfoc * ky2 / kz**2
+
+    body = np.eye(6)
+    body[0:2, 0:2] = _quad_mat2(k1x, length)
+    body[2:4, 2:4] = _quad_mat2(k1y, length)
+
+    r56 = length * (mass_eV / e_tot) ** 2  # low_energy_z_correction at pz = 0
+    osc_amplitude = g_max / kz**2
+    amplitude = length * (kz * osc_amplitude) ** 2 / (2.0 if helical else 4.0)
+    r56 += amplitude * (beta**3 / gamma**2 + 2.0)
+    body[4, 5] = r56 / beta**2  # Bmad (z, pz) -> ImpactX (t, pt)
+
+    return body
+
+
+def _map6x6(matrix: np.ndarray):
+    """Wrap a 6x6 array in the amrex small-matrix type ``LinearMap`` requires.
+
+    ``LinearMap`` takes an ``amrex.SmallMatrix_6x6_F_SI1_double``, which has no
+    constructor from a numpy array. ``to_numpy()`` returns a writable Fortran-ordered
+    view into the object (``OWNDATA`` is False), so filling that view is the supported
+    way to build one; verified to round-trip through ``LinearMap.R``.
+    """
+    import amrex.space3d as amr
+
+    out = amr.SmallMatrix_6x6_F_SI1_double()
+    out.zero()
+    out.to_numpy()[...] = matrix
+    return out
+
+
 def translate_element(
     info: dict,
     nslice: int = 8,
@@ -789,6 +954,7 @@ def translate_element(
     | ``lcavity``, travelling wave | sliced ``ExactDrift`` + ``ShortRF`` | 9.6e-6 |
     | ``x_offset``/``y_offset`` | ``dx``/``dy``, same sign | 6.2e-9 |
     | ``tilt`` | ``rotation = +degrees(TILT)`` | 2.2e-14 |
+    | ``wiggler`` | ``LinearMap`` (analytic Bmad map) | 4.2e-15 vs Bmad linear |
     | bend ``ref_tilt`` | ``rotation`` on body *and* edges | 1.2e-11 |
     | bend ``roll`` | half bends around a centre ``Kicker`` | 99.93% out of plane |
     | ``is_on = F``, straight elements | ``ExactDrift`` of the same length | 6.0e-15 |
@@ -884,6 +1050,71 @@ def translate_element(
 
     if key in DRIFT_LIKE_KEYS:
         return wrap([elements.ExactDrift(**thick())])
+
+    if key == "wiggler":
+        # LinearMap carrying Bmad's own averaged-wiggler matrix, built analytically by
+        # wiggler_body_map from this element's B_MAX/L_PERIOD/KX/P0C. Verified to
+        # 1.045e-14 against Bmad's mat6 for all 98 cu_hxr wigglers.
+        #
+        # Why a linear map is the right shape here, and not a cop-out: Bmad's
+        # bmad_standard wiggler is *itself* an averaged model with n_step = 1 (see
+        # wiggler_body_map). Its only nonlinearity is an octupole-like kick
+        #   py += k3l*(1+delta)*kz**2 * y**3/3      (px likewise, helical only)
+        # and no ImpactX element can express that. Multipole and ExactMultipole both
+        # build their kick as dpx - i*dpy = -sum(alpha_m * zeta**m)/m! with
+        # zeta = x + i*y (Multipole.H:302, ExactMultipole.H:343-366), an analytic
+        # function of zeta and hence a vacuum field. Bmad's term needs dpx = 0 with
+        # dpy proportional to y**3, which requires zeta-bar and is not analytic. That
+        # is not an ImpactX gap: with kx = 0 the undulator field is x-independent, so
+        # the ponderomotive potential goes as cosh(kz*y)**2 and is not harmonic. It is
+        # an averaged effective Hamiltonian, second order in B/p, not a magnet field.
+        #
+        # Measured size of what is dropped, against the real beam divergence at each
+        # element (beta_y from the lattice, normalised emittance 0.4 um):
+        #   HXR undulator segment  dpy/sigma_py = 1.8e-7
+        #   HXR phase shifter      dpy/sigma_py = 1.2e-9
+        #   laser-heater undulator dpy/sigma_py = 2.4e-4
+        # The linear map also freezes k1/(1+delta)**2 at delta = 0, dropping dR/ddelta
+        # over a phase advance of at most 6.7 degrees (the laser heater; the HXR
+        # segments are 2.1 degrees).
+        b_max = _get(info, "B_MAX")
+        l_period = _get(info, "L_PERIOD")
+        p0c = _get(info, "P0C")
+        if length == 0.0 or b_max == 0.0 or l_period == 0.0 or p0c <= 0.0:
+            # No field, or nothing to average over: a drift of the right length.
+            return wrap(
+                [elements.ExactDrift(name=name or key, ds=length, nslice=nslice)]
+            )
+
+        field_calc = str(info.get("_field_calc", "") or "").lower().rstrip(".")
+        if field_calc not in ("planar_model", "helical_model", ""):
+            raise UnsupportedElementError(
+                f"{name}: Bmad wiggler field_calc={field_calc!r} is a field map or a "
+                "custom field, which this translator does not read. Only the periodic "
+                "planar_model and helical_model are translated."
+            )
+        if field_calc == "":
+            _warn(
+                f"{name}: could not read this wiggler's field_calc, so the periodic "
+                "planar_model is assumed. A helical wiggler would focus equally in "
+                "both planes instead of in one."
+            )
+
+        body = wiggler_body_map(
+            length=length,
+            b_max=b_max,
+            l_period=l_period,
+            kx=_get(info, "KX"),
+            p0c=p0c,
+            mass_eV=mass_eV,
+            helical=field_calc == "helical_model",
+        )
+        # LinearMap takes no nslice -- it documents "we do not support slicing of this
+        # element" (LinearMap.H:220-228), so there are no space-charge substeps inside.
+        # That matches Bmad, which also runs this element in a single step.
+        return wrap(
+            [elements.LinearMap(R=_map6x6(body), ds=length, **align, name=name or key)]
+        )
 
     if key == "quadrupole":
         # ChrQuad, not ExactQuad. Bmad's bmad_standard quadrupole body is paraxial in
@@ -1337,6 +1568,38 @@ def _restrict_to_range(
     return indices[first : last + 1]
 
 
+def _wiggler_field_calc(tao: Any, identifier: str) -> str:
+    """Read a wiggler's ``field_calc``, following ``refer_to_lords`` to its lord.
+
+    ``field_calc`` lives in ``ele_methods``, not ``ele_gen_attribs``, so it costs an
+    extra Tao call and is only fetched for wigglers. Superposition slaves report
+    ``Refer_to_Lords``: 68 of ``cu_hxr``'s 98 wigglers do, because each physical
+    undulator is split across two slaves. ``track_a_wiggler.f90:50`` resolves that with
+    ``pointer_to_field_ele``, and the branch on planar versus helical is taken on the
+    *lord*, so following the lord here is not a nicety -- reading the slave alone
+    tells us nothing about which plane focuses.
+
+    Returns an empty string if it cannot be read; the caller warns and assumes planar.
+    """
+    try:
+        field_calc = str(dict(tao.ele_methods(identifier)).get("field_calc", "") or "")
+    except Exception:  # pragma: no cover - Tao versions without ele_methods
+        return ""
+    if field_calc.lower().rstrip(".") != "refer_to_lords":
+        return field_calc
+    try:
+        for row in tao.ele_lord_slave(identifier):
+            if str(dict(row).get("type", "")).lower() == "lord":
+                location = str(dict(row).get("location_name", "") or "")
+                if location:
+                    return str(
+                        dict(tao.ele_methods(location)).get("field_calc", "") or ""
+                    )
+    except Exception:  # pragma: no cover - no lord, or an unreadable one
+        return ""
+    return ""
+
+
 def lattice_from_tao(
     tao: Any,
     nslice: int = 8,
@@ -1414,6 +1677,8 @@ def lattice_from_tao(
             info["_multipoles"] = dict(tao.ele_multipoles(identifier)).get("data") or []
         except Exception:  # pragma: no cover - element types without a multipole table
             info["_multipoles"] = []
+        if str(head.get("key", "")).lower() == "wiggler":
+            info["_field_calc"] = _wiggler_field_calc(tao, identifier)
         element_name = str(head.get("name", "") or "")
         p0c_bmad = _get(info, "P0C")
         if gamma is None and p0c_bmad > 0.0:

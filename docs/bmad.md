@@ -154,6 +154,7 @@ coordinate difference measured, and `lume_impactx/tests/test_bmad.py` asserts it
 | bend `ref_tilt` | `rotation` on body *and* edges | 1.2e-11 |
 | bend `roll` | half bends around a centre `Kicker` | 99.93%, see below |
 | `patch`, tilt only | `PlaneXYRot(-degrees(TILT))` | 5.6e-16 |
+| `wiggler`, periodic planar/helical | `LinearMap` (analytic Bmad map) | 4.2e-15 vs Bmad's linear map; 2.4e-5 vs full `bmad_standard` |
 | zeroed thin `multipole` | `Marker` | exact |
 | `is_on = F` (straight elements) | `ExactDrift` of the same length | 6.0e-15 |
 | aperture limits | `Aperture`, shape from `aperture_type` | exact |
@@ -230,13 +231,77 @@ default that costs **9.1e-2**. The warning says which case you are in.
 
 `skip_unsupported=True` replaces an element with no verified equivalent by a **drift of
 its own length**, not by a marker, so everything downstream stays at the right `s`. That
-matters more than it sounds: LCLS `cu_hxr`'s 98 wigglers and 2 patches account for
-109.4 m of a 1750.9 m lattice, so skipping them as markers produced a lattice 6.2% short.
+matters more than it sounds: an element replaced by a marker moves everything after it.
 
 The drift is not offered as an equivalent. Measured against Bmad on `cu_hxr`'s own
-undulators, a drift is **7.0e-3** out for an HXR segment and **2.5e-1** out for the
-laser-heater undulator, so strict translation still refuses them and the warning carries
-those numbers.
+undulators, a drift was **7.0e-3** out for an HXR segment and **2.5e-1** out for the
+laser-heater undulator, which is why wigglers are now translated properly instead — see
+[Wigglers and undulators](#wigglers-and-undulators). LCLS `cu_hxr` translates in strict
+mode: 9907 ImpactX elements over its full 1750.883 m.
+
+## Wigglers and undulators
+
+A wiggler becomes a **`LinearMap`** carrying an analytic copy of Bmad's own averaged
+wiggler map, built from the element's `B_MAX`, `L_PERIOD`, `KX` and `P0C` rather than
+scraped from Tao, so it follows a change of energy or field instead of going stale.
+
+That a 6x6 suffices is a fact about Bmad, not a concession. `bmad_standard` wiggler
+tracking is **not** a symplectic field integrator: it is the averaged (ponderomotive)
+model, and `track_a_wiggler.f90:59` collapses it to a *single* step when the element
+carries no multipoles. All 98 of `cu_hxr`'s wigglers are `tracking_method =
+Bmad_Standard` with an empty multipole table, so `NUM_STEPS` (6, 20 or 100) is consumed
+only by PTC and never by tracking.
+
+Verified against Bmad's own `mat6` for all 98 `cu_hxr` wigglers, in the ImpactX basis
+and the lab frame: **1.045e-14**. Against Bmad tracking a bunch with `tracking_method =
+linear`, covering planar, helical, and tilts of 0, pi/2 and 0.3 rad: **4e-15 to
+8.5e-14**.
+
+Three pieces make up the map:
+
+- Transverse: `quad_mat2_calc` per plane with `k1x = kfoc*(kx/kz)**2` and
+  `k1y = -kfoc*(kz**2 + kx**2)/kz**2`, `kfoc = 0.5*g_max**2`, `g_max = c*B_MAX/P0C`.
+  With `kx = 0` — every `cu_hxr` wiggler — one plane is a **pure drift** and the other
+  focuses. Helical instead gets `k1x = k1y = -kfoc`, focusing equally in both.
+- `low_energy_z_correction.f90` at `pz = 0`, giving `L*(m/E_tot)**2`.
+- The undulation path lengthening, `L*(kz*OSC_AMPLITUDE)**2/4 * (beta**3/gamma**2 + 2)`.
+
+The last two combine to `R56 = (L/gamma**2)*(1 + K**2/2)`, so the undulation term
+**dominates**: it is 3.00x, 5.12x and 1.96x the plain drift `R56` for `cu_hxr`'s three
+wiggler families (K = 2.000, 2.872, 1.385). Any element carrying only a drift `R56` is
+wrong by that factor.
+
+Element `TILT` is passed through as ImpactX `rotation`, not baked into the matrix. This
+matters for `cu_hxr`: its 64 HXR undulator segments carry `TILT = pi/2`, so their
+focusing is **horizontal**, while the phase shifters and the laser-heater undulator
+(`TILT = 0`) focus vertically.
+
+### What a linear map cannot hold
+
+Bmad's only wiggler nonlinearity is an octupole-like kick, `py += k3l*(1+delta)*kz**2 *
+y**3/3` (and the same in `px`, helical only). **No ImpactX element can express it**, and
+that is not a gap in ImpactX. Both `Multipole` and `ExactMultipole` build their kick as
+`dpx - i*dpy = -sum(alpha_m * zeta**m)/m!` with `zeta = x + i*y` (`Multipole.H:302`,
+`ExactMultipole.H:343-366`) — an analytic function of `zeta`, hence a vacuum field.
+Bmad's term needs `dpx = 0` with `dpy` proportional to `y**3`, which requires
+`zeta`-conjugate and is not analytic. With `kx = 0` the undulator field is
+x-independent, so the ponderomotive potential goes as `cosh(kz*y)**2` and is not
+harmonic: it is an averaged effective Hamiltonian, second order in `B/p`, not a field.
+The `Exact` and `Chr` axes do not help — they change the drift between kicks and the
+`pt` dependence, not the harmonic constraint — and there is no `ChrMultipole`.
+
+Measured against the real beam divergence at each element (`beta_y` from the lattice,
+0.4 um normalised emittance), the dropped octupole is `dpy/sigma_py` of 1.8e-7 for an
+HXR segment, 1.2e-9 for a phase shifter and 2.4e-4 for the laser heater. The 6x6 also
+freezes `k1/(1+delta)**2` at `delta = 0` over a phase advance of at most 6.7 degrees.
+
+End to end against full `bmad_standard`, at each element's own energy and beam size:
+**2.4e-5** for an HXR segment and **1.1e-3** for the laser-heater undulator — roughly
+300x and 230x better than the drift they replace.
+
+A wiggler with `B_MAX = 0` or no period becomes an exact drift of its length. A
+`fieldmap` or custom-field wiggler is refused rather than silently given the periodic
+model.
 
 ## What is dropped
 
@@ -261,8 +326,8 @@ Each of these warns with the element name and attribute:
 
 A switched-off **bend** raises rather than warning: `track_a_bend.f90:90-94` zeroes the
 field but keeps the curved geometry, so it is not a drift and ImpactX cannot express it.
-So does any element with length and no verified equivalent — `taylor`, `wiggler`,
-`patch`, `sol_quad`, `match`, `elseparator`. Pass `skip_unsupported=True` to replace them
+So does any element with length and no verified equivalent — `taylor`, `sol_quad`,
+`match`, `elseparator`, and a `patch` that displaces or re-times the frame. Pass `skip_unsupported=True` to replace them
 with markers and warn instead:
 
 ```python

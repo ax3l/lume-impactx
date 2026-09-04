@@ -830,6 +830,46 @@ def track_both(tmp_path, monkeypatch):
             "d1, c, q, d1",
             1e-4,
         ),
+        (
+            "planar wiggler against Bmad's own linear map",
+            (
+                "w: wiggler, l = 1.0, b_max = 1.0, n_period = 10,"
+                " tracking_method = linear, mat6_calc_method = bmad_standard"
+            ),
+            "d1, w, d1",
+            1e-12,
+        ),
+        (
+            "helical wiggler against Bmad's own linear map",
+            (
+                "w: wiggler, l = 1.0, b_max = 1.0, n_period = 10,"
+                " field_calc = helical_model,"
+                " tracking_method = linear, mat6_calc_method = bmad_standard"
+            ),
+            "d1, w, d1",
+            1e-12,
+        ),
+        (
+            # A tilt that is neither 0 nor pi/2, so the rotation *sign* is pinned. At
+            # pi/2 both signs merely swap the planes and a wrong one would pass.
+            "tilted wiggler against Bmad's own linear map",
+            (
+                "w: wiggler, l = 1.0, b_max = 1.0, n_period = 10, tilt = 0.3,"
+                " tracking_method = linear, mat6_calc_method = bmad_standard"
+            ),
+            "d1, w, d1",
+            1e-12,
+        ),
+        (
+            # cu_hxr's laser-heater undulator, at its own energy. Against full
+            # bmad_standard rather than the linear map, so this is the honest cost of
+            # the octupole and the chromatic k1/(1+delta)**2 that a 6x6 cannot hold.
+            # A drift in its place is 2.5e-1, so this is ~230x better.
+            "laser-heater undulator against full bmad_standard",
+            "w: wiggler, l = 0.27, b_max = 0.2747, l_period = 0.054",
+            "d1, w, d1",
+            5e-3,
+        ),
     ],
 )
 def test_tracking_matches_bmad(track_both, label, body, line, tolerance):
@@ -838,6 +878,131 @@ def test_tracking_matches_bmad(track_both, label, body, line, tolerance):
     # A comparison that returns exactly zero means the two sides were never really
     # compared -- guard against the harness silently degenerating.
     assert 0.0 < worst < tolerance, f"{label}: {worst:.3e}"
+
+
+def test_wiggler_uses_a_linear_map_matching_bmads_own_mat6(make_tao):
+    """LinearMap carrying an analytically-built copy of Bmad's averaged wiggler map.
+
+    Bmad's `bmad_standard` wiggler is itself an averaged (ponderomotive) model that runs
+    in a single step when the element has no multipoles (`track_a_wiggler.f90:59`), so a
+    6x6 is the natural shape rather than a concession. This asserts the matrix we build
+    from B_MAX/L_PERIOD/KX/P0C alone is Bmad's own `mat6`.
+    """
+    from lume_impactx.interfaces.bmad import wiggler_body_map
+
+    tao = make_tao("w: wiggler, l = 1.0, b_max = 1.0, n_period = 10", "w", e_tot=100e6)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", TaoTranslationWarning)
+        lattice = lattice_from_tao(tao)
+
+    assert kinds(lattice) == ["Marker", "LinearMap", "Marker"]
+    wiggler = lattice[1]
+    assert wiggler.ds == pytest.approx(1.0)
+
+    ours = np.array(wiggler.R.to_numpy())
+    # Bmad's mat6 for the same element, converted into ImpactX's (t, pt) basis.
+    index = next(
+        i
+        for i, key in enumerate(
+            tao.lat_list("*", "ele.key", flags="-track_only -index_order")
+        )
+        if str(key).lower() == "wiggler"
+    )
+    rows = tao.ele_mat6(index)
+    bmad = np.array([rows[str(r)] for r in range(1, 7)], dtype=float)
+    p0c = float(tao.ele_gen_attribs(index)["P0C"])
+    beta = p0c / math.hypot(p0c, ELECTRON_MASS_EV)
+    basis = np.diag([1.0, 1.0, 1.0, 1.0, -1.0 / beta, -beta])
+    expected = basis @ bmad @ np.linalg.inv(basis)
+
+    assert np.abs(ours - expected).max() < 1e-12
+    # ...and that the public helper is what produced it.
+    assert (
+        np.abs(ours - wiggler_body_map(1.0, 1.0, 0.1, 0.0, p0c, ELECTRON_MASS_EV)).max()
+        < 1e-15
+    )
+
+
+def test_wiggler_r56_is_dominated_by_the_undulation_not_the_drift():
+    """R56 = (L/gamma**2)*(1 + K**2/2): the undulation term is 2-5x the drift term.
+
+    This is the piece an element carrying only a drift R56 gets wrong, and it is not a
+    small correction. The three ratios are cu_hxr's own wiggler families.
+    """
+    from lume_impactx.interfaces.bmad import wiggler_body_map
+
+    for b_max, l_period, length, p0c, expected in (
+        (0.8238266207893611, 0.026, 1.677, 8e9, 3.00),  # HXR undulator segment, K=2.000
+        (0.6212659, 0.0495, 0.0495, 8e9, 5.12),  # HXR phase shifter,     K=2.872
+        (0.2747312, 0.054, 0.27, 135e6, 1.96),  # laser-heater undulator, K=1.385
+    ):
+        body = wiggler_body_map(length, b_max, l_period, 0.0, p0c, ELECTRON_MASS_EV)
+        beta_gamma = p0c / ELECTRON_MASS_EV
+        drift_r56 = length / beta_gamma**2
+        assert body[4, 5] / drift_r56 == pytest.approx(expected, rel=1e-3)
+
+
+def test_planar_and_helical_wigglers_focus_in_different_planes(make_tao):
+    """kx = 0 planar focuses in one plane only; helical focuses equally in both.
+
+    `attribute_bookkeeper.f90:885-896`: planar gives k1x = kfoc*(kx/kz)**2, which is
+    zero for a wide-pole undulator, against k1y = -kfoc. Helical gives k1x = k1y.
+    Reading `field_calc` off a superposition slave returns `refer_to_lords`, so this
+    also covers following the lord -- getting it wrong swaps which plane focuses.
+    """
+    planar = lattice_from_tao(
+        make_tao("w: wiggler, l = 1.0, b_max = 1.0, n_period = 10", "w", e_tot=100e6)
+    )[1]
+    helical = lattice_from_tao(
+        make_tao(
+            "w: wiggler, l = 1.0, b_max = 1.0, n_period = 10, field_calc = helical_model",
+            "w",
+            e_tot=100e6,
+        )
+    )[1]
+
+    p = np.array(planar.R.to_numpy())
+    h = np.array(helical.R.to_numpy())
+    # planar: x is a pure drift (R21 == 0), y focuses (R43 < 0)
+    assert p[1, 0] == pytest.approx(0.0, abs=1e-18)
+    assert p[3, 2] < -1e-3
+    # helical: both planes focus, equally
+    assert h[1, 0] == pytest.approx(h[3, 2], rel=1e-12)
+    assert h[1, 0] < -1e-3
+
+
+def test_wiggler_without_field_becomes_a_drift(make_tao):
+    """b_max = 0 has nothing to average over, so it is exactly a drift of its length."""
+    tao = make_tao("w: wiggler, l = 0.7, b_max = 0, n_period = 10", "w", e_tot=100e6)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", TaoTranslationWarning)
+        lattice = lattice_from_tao(tao)
+
+    assert kinds(lattice) == ["Marker", "ExactDrift", "Marker"]
+    assert lattice[1].ds == pytest.approx(0.7)
+
+
+def test_wiggler_with_a_field_map_is_refused():
+    """Only the periodic planar/helical models are translated.
+
+    A `fieldmap` wiggler carries a real 3D field this translator never reads, so
+    silently applying the periodic model to it would invent physics.
+    """
+    from lume_impactx.interfaces.bmad import translate_element
+
+    with pytest.raises(UnsupportedElementError, match="field map"):
+        translate_element(
+            {
+                "key": "wiggler",
+                "name": "W",
+                "L": 1.0,
+                "B_MAX": 1.0,
+                "L_PERIOD": 0.1,
+                "KX": 0.0,
+                "P0C": 100e6,
+                "_field_calc": "FieldMap",
+            }
+        )
 
 
 # -- the lume-impact-style surface -----------------------------------------------------
