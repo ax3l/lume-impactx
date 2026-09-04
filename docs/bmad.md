@@ -153,6 +153,8 @@ coordinate difference measured, and `lume_impactx/tests/test_bmad.py` asserts it
 | `tilt` | `rotation = +degrees(TILT)` | 2.2e-14 |
 | bend `ref_tilt` | `rotation` on body *and* edges | 1.2e-11 |
 | bend `roll` | half bends around a centre `Kicker` | 99.93%, see below |
+| `patch`, tilt only | `PlaneXYRot(-degrees(TILT))` | 5.6e-16 |
+| zeroed thin `multipole` | `Marker` | exact |
 | `is_on = F` (straight elements) | `ExactDrift` of the same length | 6.0e-15 |
 | aperture limits | `Aperture`, shape from `aperture_type` | exact |
 
@@ -223,6 +225,18 @@ carried to 3e-12 — `ShortRF` updates ImpactX's reference particle directly —
 travelling-wave cavity tracks to 9.6e-6. But Bmad's Rosenzweig–Serafini edge focusing and
 the standing-wave ponderomotive focusing are not modelled, and for the standing-wave
 default that costs **9.1e-2**. The warning says which case you are in.
+
+## Skipping what cannot be translated
+
+`skip_unsupported=True` replaces an element with no verified equivalent by a **drift of
+its own length**, not by a marker, so everything downstream stays at the right `s`. That
+matters more than it sounds: LCLS `cu_hxr`'s 98 wigglers and 2 patches account for
+109.4 m of a 1750.9 m lattice, so skipping them as markers produced a lattice 6.2% short.
+
+The drift is not offered as an equivalent. Measured against Bmad on `cu_hxr`'s own
+undulators, a drift is **7.0e-3** out for an HXR segment and **2.5e-1** out for the
+laser-heater undulator, so strict translation still refuses them and the warning carries
+those numbers.
 
 ## What is dropped
 
