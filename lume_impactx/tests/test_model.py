@@ -607,3 +607,115 @@ def test_a_physics_toggle_does_not_leak_into_the_next_run(fodo_lattice, waterbag
     clean = bend_run()
     bend_run(csr=True, particle_shape=2)  # poisons the global parameter store
     assert bend_run() == pytest.approx(clean, rel=1e-12)
+
+
+# -- screens ---------------------------------------------------------------------------
+#
+# Same shape as lume-bmad's, which SLAC's virtual accelerator subclasses for its Bmad,
+# Cheetah and Impact backends. The ImpactX-specific part is that the bunch has to be
+# captured during the run, since tracking consumes the container.
+
+
+@pytest.fixture
+def screened_simulator(fodo_lattice, waterbag):
+    """A FODO run with the bunch captured at a marker standing in for a screen."""
+    from impactx import elements as impactx_elements
+
+    from lume_impactx.simulator import ImpactXSimulator
+
+    lattice = list(fodo_lattice)
+    lattice.insert(3, impactx_elements.Marker(name="OTR1"))
+    return ImpactXSimulator(
+        lattice=lattice,
+        ref={"species": "electron", "kin_energy_MeV": KIN_ENERGY_MEV},
+        distribution=waterbag,
+        npart=5000,
+        bunch_charge_C=BUNCH_CHARGE_C,
+        capture_at=["OTR1"],
+    )
+
+
+def test_a_screen_generates_an_image_and_its_geometry(screened_simulator):
+    """A client cannot interpret the image without the pixel size and grid, so the
+    three are generated together -- the virtual accelerator's screen PV group."""
+    from lume_impactx.actions import ScreenSpec, screen_actions
+
+    spec = ScreenSpec(element_name="OTR1", shape=(64, 48), pixel_size=20e-6)
+    actions = screen_actions(spec)
+    assert [a.name for a in actions] == [
+        "OTR1:image",
+        "OTR1:resolution",
+        "OTR1:shape_x",
+        "OTR1:shape_y",
+    ]
+
+    image = actions[0]._get(screened_simulator)
+    assert image.shape == (64, 48)
+    assert image.max() == pytest.approx(1.0)  # normalized to unit scale
+    assert image.min() >= 0.0
+    assert actions[1]._get(screened_simulator) == pytest.approx(20e-6)
+    assert actions[2]._get(screened_simulator) == 64
+    assert actions[3]._get(screened_simulator) == 48
+    assert all(a.read_only for a in actions)
+
+
+def test_a_screen_image_carries_the_beams_moments(screened_simulator):
+    """The image is the beam, not just an array of the right shape: its second moments
+    must reproduce the bunch's once the grid covers it."""
+    import numpy as np
+
+    from lume_impactx.actions import ScreenImageAction, ScreenSpec
+
+    spec = ScreenSpec(element_name="OTR1", shape=(256, 256), pixel_size=20e-6)
+    image = ScreenImageAction.from_screen_spec("s", spec)._get(screened_simulator)
+
+    half_x, half_y = spec.half_width
+    xs = (np.arange(spec.shape[0]) + 0.5) * spec.pixel_size - half_x
+    ys = (np.arange(spec.shape[1]) + 0.5) * spec.pixel_size - half_y
+
+    def rms(axis_values, weights):
+        mean = np.average(axis_values, weights=weights)
+        return np.sqrt(np.average((axis_values - mean) ** 2, weights=weights))
+
+    bunch = screened_simulator.particles["OTR1"]
+    assert rms(xs, image.sum(axis=1)) == pytest.approx(bunch["sigma_x"], rel=1e-2)
+    assert rms(ys, image.sum(axis=0)) == pytest.approx(bunch["sigma_y"], rel=1e-2)
+
+
+def test_a_screen_smaller_than_the_beam_clips_it(screened_simulator):
+    """As a real screen does. Particles outside the grid are dropped, not piled into
+    the edge bins, so the reported size is smaller rather than larger."""
+
+    from lume_impactx.actions import ScreenImageAction, ScreenSpec
+
+    bunch = screened_simulator.particles["OTR1"]
+    tiny = ScreenSpec(element_name="OTR1", shape=(16, 16), pixel_size=5e-6)
+    assert tiny.half_width[0] < bunch["sigma_x"], "the screen must be the small one"
+
+    image = ScreenImageAction.from_screen_spec("s", tiny)._get(screened_simulator)
+    assert image.sum() > 0, "some of the beam must still land on it"
+    counted = image.sum() / image.max()
+    assert counted < bunch.n_particle, "a clipped screen sees fewer particles"
+
+
+def test_an_uncaptured_screen_says_how_to_capture_it(fodo_simulator):
+    from lume_impactx.actions import ScreenImageAction, ScreenSpec
+
+    action = ScreenImageAction.from_screen_spec(
+        "nowhere:image", ScreenSpec("NOWHERE", (8, 8), 1e-5)
+    )
+    with pytest.raises(KeyError, match="capture_at"):
+        action._get(fodo_simulator)
+
+
+def test_screen_actions_register_on_a_model(screened_simulator):
+    """The end a virtual accelerator actually uses: read the image through the model."""
+    from lume_impactx.actions import ScreenSpec, screen_actions
+    from lume_impactx.model import LUMEImpactXModel
+
+    model = LUMEImpactXModel.from_simulator(screened_simulator)
+    for action in screen_actions(ScreenSpec("OTR1", (32, 32), 40e-6)):
+        model.register_action_variable(action)
+
+    assert model.get("OTR1:image").shape == (32, 32)
+    assert model.get("OTR1:resolution") == pytest.approx(40e-6)

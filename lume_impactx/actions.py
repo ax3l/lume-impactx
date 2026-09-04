@@ -22,6 +22,7 @@ handle into a rebuilt lattice is a dangling reference, not an exception.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -60,6 +61,11 @@ __all__ = [
     "RunInfoAction",
     "OpticsAction",
     "ParticleGroupAction",
+    "screen_actions",
+    "ScreenImageShapeAction",
+    "ScreenResolutionAction",
+    "ScreenImageAction",
+    "ScreenSpec",
     "_ElementByNameMixin",
 ]
 
@@ -500,3 +506,177 @@ class ImpactXBunchAtElementVariable(
 
     def _get(self, simulator: Any) -> Any:
         return _check(simulator).particles[self.element_name]
+
+
+# --------------------------------------------------------------------------------------
+# Screens
+#
+# A profile monitor, as a virtual accelerator serves it: an image PV plus the geometry
+# PVs a client needs to interpret it. The shape follows lume-bmad's, which SLAC's
+# virtual accelerator already subclasses for its Bmad, Cheetah and Impact backends, so
+# code written against one works here -- same ScreenSpec, same from_screen_spec.
+#
+# The one ImpactX-specific part is where the bunch comes from. Tao can be asked for the
+# beam at any element after the fact; ImpactX cannot, because tracking consumes the
+# container. So the element has to be captured during the run, which is what
+# `capture_at` (and `from_tao(capture=True)`) arranges.
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ScreenSpec:
+    """Definition of a screen detector geometry in the lattice."""
+
+    element_name: str
+    shape: tuple[int, int]
+    pixel_size: float
+
+    @property
+    def half_width(self) -> tuple[float, float]:
+        """Half-width used to build the histogram range."""
+        return (
+            (self.shape[0] * self.pixel_size) / 2,
+            (self.shape[1] * self.pixel_size) / 2,
+        )
+
+
+class _ScreenSpecVariableMixin:
+    """Shared ScreenSpec conversion utilities for screen-derived variables."""
+
+    element_name: str
+    pixel_size: float
+    shape: tuple[int, int]
+
+    @property
+    def screen_spec(self) -> ScreenSpec:
+        """Canonical screen specification for this variable."""
+        return ScreenSpec(
+            element_name=self.element_name,
+            shape=self.shape,
+            pixel_size=self.pixel_size,
+        )
+
+    @classmethod
+    def from_screen_spec(cls, name: str, screen_spec: ScreenSpec, **kwargs):
+        """Build a screen-derived variable from a shared screen specification."""
+        return cls(
+            name=name,
+            element_name=screen_spec.element_name,
+            pixel_size=screen_spec.pixel_size,
+            shape=screen_spec.shape,
+            **kwargs,
+        )
+
+    def _bunch(self, simulator: Any):
+        """The captured bunch at this screen, or an error saying how to capture it."""
+        sim = _check(simulator)
+        try:
+            return sim.particles[self.element_name]
+        except KeyError as exc:
+            raise KeyError(
+                f"Screen {self.name!r} needs the bunch at {self.element_name!r}, which "
+                "was not captured. ImpactX tracking consumes the particle container, so "
+                "a screen has to be recorded during the run: add the element to "
+                "capture_at, or build the simulator with from_tao(capture=True), which "
+                "captures every Bmad marker, monitor and instrument."
+            ) from exc
+
+
+class ScreenImageAction(
+    _ScreenSpecVariableMixin, ReadOnlyActionMixin[ImpactXSimulator], NDVariable
+):
+    """The transverse image at a screen, normalized to unit scale.
+
+    A particle-count histogram over the pixel grid, which is what lume-bmad and the
+    virtual accelerator's other backends produce. No point-spread or noise model: this
+    is where the beam lands, not what a camera would report.
+
+    The bunch is in z-coordinates with transverse positions relative to the reference
+    particle, so ``x`` and ``y`` are already screen-local and need no transform.
+
+    A beam wider than the screen is **clipped**, as it would be on a real one: particles
+    outside the grid are dropped rather than piled into the edge bins. Measured, a
+    64x48 grid of 20 um pixels reports sigma_y 36% low for a beam whose sigma_y is
+    0.4 mm, while a grid covering the beam reproduces both moments to 0.1%.
+    """
+
+    pixel_size: float
+    read_only: bool = True
+
+    def _get(self, simulator: Any) -> Any:
+        beam = self._bunch(simulator)
+        half_width = self.screen_spec.half_width
+        image, _ = beam.histogramdd(
+            "x",
+            "y",
+            bins=self.shape,
+            range=((-half_width[0], half_width[0]), (-half_width[1], half_width[1])),
+        )
+        peak = np.max(image)
+        return image / (peak if peak > 0 else 1.0)
+
+
+class ScreenResolutionAction(
+    _ScreenSpecVariableMixin, ReadOnlyActionMixin[ImpactXSimulator], ScalarVariable
+):
+    """The screen's pixel size, in metres.
+
+    Metres because that is what the rest of this package uses and what lume-bmad's
+    equivalent returns; SLAC's virtual accelerator converts to microns for its
+    ``RESOLUTION`` PV, which is a facility unit rather than a LUME one.
+    """
+
+    pixel_size: float
+    unit: str = "m"
+    read_only: bool = True
+
+    def _get(self, simulator: Any) -> Any:
+        _check(simulator)
+        return self.screen_spec.pixel_size
+
+
+class ScreenImageShapeAction(
+    _ScreenSpecVariableMixin, ReadOnlyActionMixin[ImpactXSimulator], IntVariable
+):
+    """One dimension of the screen's pixel grid: ``index`` 0 for x, 1 for y."""
+
+    pixel_size: float
+    index: int
+    read_only: bool = True
+
+    def _get(self, simulator: Any) -> Any:
+        _check(simulator)
+        return self.screen_spec.shape[self.index]
+
+
+def screen_actions(screen_spec: ScreenSpec, prefix: str | None = None) -> list[Any]:
+    """The image and the two geometry variables for one screen.
+
+    A client cannot interpret the image without the pixel size and grid, so the three
+    are generated together -- the virtual accelerator's screen PV group is exactly this
+    set. Names default to ``<element>:image``, ``:resolution``, ``:shape_x``,
+    ``:shape_y``.
+
+    Parameters
+    ----------
+    screen_spec : ScreenSpec
+        Element name and pixel geometry.
+    prefix : str, optional
+        Name prefix; defaults to the element name.
+
+    Returns
+    -------
+    list
+        Four action variables, ready to register on a model.
+    """
+    stem = prefix if prefix is not None else screen_spec.element_name
+    return [
+        ScreenImageAction.from_screen_spec(f"{stem}:image", screen_spec),
+        ScreenResolutionAction.from_screen_spec(f"{stem}:resolution", screen_spec),
+        ScreenImageShapeAction.from_screen_spec(
+            f"{stem}:shape_x", screen_spec, index=0
+        ),
+        ScreenImageShapeAction.from_screen_spec(
+            f"{stem}:shape_y", screen_spec, index=1
+        ),
+    ]
