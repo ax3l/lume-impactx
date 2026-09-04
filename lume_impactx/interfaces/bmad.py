@@ -565,6 +565,29 @@ def _bend_roll(info: dict, name: str, angle: float, align: dict, bend_body) -> l
     )
 
 
+#: Tao reports a multipole table in whichever representation the element uses: a thin
+#: `multipole` comes back as KnL/Tn, while error multipoles on a magnet come back as
+#: An/Bn. Checking only one silently reads a live corrector as empty.
+_MULTIPOLE_STRENGTH_KEYS = ("An", "Bn", "KnL", "An (equiv)", "Bn (equiv)")
+
+
+def _live_multipole_orders(info: dict) -> list:
+    """Orders of the multipole terms that are actually non-zero, in order.
+
+    ``lattice_from_tao`` stows ``tao.ele_multipoles(...)["data"]`` here.
+    """
+    return sorted(
+        entry.get("index")
+        for entry in (info.get("_multipoles") or [])
+        if any(entry.get(key) for key in _MULTIPOLE_STRENGTH_KEYS)
+    )
+
+
+def _has_multipole_content(info: dict) -> bool:
+    """Whether a thin multipole element actually carries a moment."""
+    return bool(_live_multipole_orders(info))
+
+
 def _check_multipole_errors(info: dict, name: str) -> None:
     """Warn about Bmad multipole error tables attached to a normal magnet.
 
@@ -576,11 +599,7 @@ def _check_multipole_errors(info: dict, name: str) -> None:
     # NOT `has#ab_multipoles` from ele_head: that is True for every quadrupole,
     # meaning only that the structure exists. The live values come from
     # tao.ele_multipoles(...)["data"], which lattice_from_tao stows here.
-    orders = sorted(
-        entry.get("index")
-        for entry in (info.get("_multipoles") or [])
-        if entry.get("An") or entry.get("Bn")
-    )
+    orders = _live_multipole_orders(info)
     if orders:
         _warn(
             f"{name}: Bmad multipole error terms of order {orders} (A_n/B_n) are "
@@ -1056,6 +1075,12 @@ def translate_element(
             "ImpactX equivalent."
         )
 
+    if key in ("multipole", "ab_multipole") and not _has_multipole_content(info):
+        # A corrector set to zero. Every SLAC lattice carries these -- cu_hxr's SQ01 and
+        # CQ01 both have an empty multipole table -- and refusing them would mean no
+        # production lattice could be translated without skip_unsupported.
+        return wrap([elements.Marker(name=name or key)])
+
     if key in _MAP_AT_ZERO_LENGTH_KEYS:
         raise UnsupportedElementError(
             f"{name}: Bmad element type {key!r} carries a transfer map even at zero "
@@ -1380,8 +1405,27 @@ def lattice_from_tao(
         except UnsupportedElementError as exc:
             if not skip_unsupported:
                 raise
-            _warn(f"{exc} Replaced by a marker.")
-            translated = [elements.Marker(name=element_name or "skipped")]
+            # A drift, not a marker, whenever the element has length. Replacing a 1.7 m
+            # undulator with a zero-length marker moves every element downstream of it:
+            # measured on LCLS cu_hxr, skipping its 98 wigglers and 2 patches lost
+            # 109.4 m of a 1750.9 m lattice -- 6.2% -- silently.
+            length = _get(info, "L")
+            if length > 0.0:
+                _warn(
+                    f"{exc} Replaced by a drift of its {length} m, so the elements "
+                    "after it stay at the right s -- but what it does to the beam is "
+                    "still lost, and that is not always small. Measured against Bmad on "
+                    "cu_hxr's own undulators, a drift is 7.0e-3 out for an HXR segment "
+                    "and 2.5e-1 out for the laser-heater undulator."
+                )
+                translated = [
+                    elements.ExactDrift(
+                        name=element_name or "skipped", ds=length, nslice=nslice
+                    )
+                ]
+            else:
+                _warn(f"{exc} Replaced by a marker.")
+                translated = [elements.Marker(name=element_name or "skipped")]
 
         if momentum_scale != 1.0:
             _warn(

@@ -467,12 +467,43 @@ def test_rfcavity_normalises_the_voltage_by_the_lattice_species_mass(make_tao):
 
 
 def test_an_unsupported_element_raises_and_can_be_skipped(make_tao):
+    """Skipping keeps the element's length, so the rest of the lattice does not move.
+
+    Replacing a length-carrying element with a zero-length marker shifts everything
+    downstream of it: on LCLS cu_hxr, skipping its 98 wigglers and 2 patches lost
+    109.4 m of a 1750.9 m lattice -- 6.2% -- without saying so.
+    """
     tao = make_tao("s: sol_quad, l = 0.4, ks = 0.3, k1 = 1.0", "s")
     with pytest.raises(UnsupportedElementError, match="sol_quad"):
         lattice_from_tao(tao)
+
+    with pytest.warns(TaoTranslationWarning, match="Replaced by a drift"):
+        lattice = lattice_from_tao(tao, skip_unsupported=True)
+    assert kinds(lattice) == ["Marker", "ExactDrift", "Marker"]
+    assert lattice[1].ds == pytest.approx(0.4)
+
+
+def test_a_skipped_zero_length_element_is_still_a_marker(make_tao):
+    tao = make_tao("p: patch, tilt = 0.1", "p")
     with pytest.warns(TaoTranslationWarning, match="Replaced by a marker"):
         lattice = lattice_from_tao(tao, skip_unsupported=True)
     assert kinds(lattice) == ["Marker", "Marker", "Marker"]
+
+
+def test_a_zeroed_thin_multipole_is_not_an_error(make_tao):
+    """Every SLAC lattice carries correctors set to zero -- cu_hxr's SQ01 and CQ01 both
+    have an empty multipole table -- so refusing them would mean no production lattice
+    could be translated without skip_unsupported."""
+    tao = make_tao("sq: multipole", "sq")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", TaoTranslationWarning)
+        lattice = lattice_from_tao(tao)
+    assert kinds(lattice) == ["Marker", "Marker", "Marker"]
+
+    # One that actually carries a moment is still refused.
+    live = make_tao("sq: multipole, k1l = 0.02", "sq")
+    with pytest.raises(UnsupportedElementError, match="carries a transfer map"):
+        lattice_from_tao(live)
 
 
 def test_lcavity_is_supported_and_carries_the_reference_energy(make_tao):
