@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import numpy as np
+import shutil
+
 import pytest
 
 from lume_impactx.archive import (
@@ -195,6 +197,77 @@ def test_beam_monitor_reader_matches_the_in_memory_bunch(tmp_path, monkeypatch):
     # Everything that reached the monitor is alive, and ids carry across.
     assert from_file.n_alive == from_file.n_particle
     assert len(np.unique(from_file.id)) == from_file.n_particle
+
+
+@pytest.mark.slow
+def test_a_newer_lost_file_is_recognised_by_its_s_lost_record(tmp_path, monkeypatch):
+    """The lost file is detected by the record it carries, not only by a zeroed
+    reference particle.
+
+    ImpactX wrote a zeroed reference into particles_lost before
+    BLAST-ImpactX/impactx#1647, and newer files carry a usable one -- at which point the
+    zeroed-reference signature stops firing and only the s_lost record identifies the
+    file. Nothing else covers that branch, because the ImpactX in this environment still
+    writes the old form, so this builds the newer shape by hand: a real monitor file,
+    whose reference *is* physical, with an s/lost record grafted on.
+    """
+    import h5py
+    from impactx import ImpactX, distribution, elements
+
+    from lume_impactx.utils import read_beam_monitor
+
+    monkeypatch.chdir(tmp_path)
+    sim = ImpactX()
+    sim.verbose = 0
+    sim.tiny_profiler = False
+    sim.space_charge = False
+    sim.diagnostics = True
+    sim.slice_step_diagnostics = False
+    sim.init_grids()
+    sim.beam.ref.set_species("electron").set_kin_energy_MeV(100.0)
+    sim.add_particles(
+        1e-9,
+        distribution.Waterbag(
+            lambdaX=2e-4,
+            lambdaY=2e-4,
+            lambdaT=1e-4,
+            lambdaPx=2e-5,
+            lambdaPy=2e-5,
+            lambdaPt=1e-4,
+        ),
+        200,
+    )
+    monitor = elements.BeamMonitor("mon", backend="h5")
+    sim.lattice.extend(
+        [monitor, elements.ExactDrift(name="dr", ds=0.5, nslice=2), monitor]
+    )
+    sim.track_particles()
+    sim.finalize()
+
+    source = tmp_path / "diags" / "openPMD" / "mon.h5"
+    # Control: as written, this is a monitor file and everything in it is alive.
+    assert read_beam_monitor(str(source)).n_alive > 0
+
+    newer = tmp_path / "newer_lost.h5"
+    shutil.copy(source, newer)
+    with h5py.File(newer, "r+") as handle:
+        base = handle["data"]
+        iteration = sorted(base.keys(), key=int)[-1]
+        beam = base[iteration]["particles"]["beam"]
+        weighting = beam["weighting"]
+        group = beam.create_group("s")
+        component = group.create_dataset(
+            "lost", data=np.linspace(0.1, 0.4, weighting.shape[0])
+        )
+        for key, value in weighting.attrs.items():
+            component.attrs[key] = value
+        group.attrs["unitDimension"] = np.array([1.0, 0, 0, 0, 0, 0, 0])
+        group.attrs["timeOffset"] = np.float32(0.0)
+
+    with pytest.warns(UserWarning, match="s_lost"):
+        lost = read_beam_monitor(str(newer), strict=False)
+    assert lost.n_alive == 0, "the s_lost record alone must identify a lost file"
+    assert lost.n_dead == lost.n_particle
 
 
 @pytest.mark.slow
