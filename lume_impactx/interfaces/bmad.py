@@ -1385,10 +1385,14 @@ def lattice_from_tao(
 
         if momentum_scale != 1.0:
             _warn(
-                f"{element_name}: an upstream rfcavity moved ImpactX's reference energy "
-                "but not Bmad's, so this element's normalised strengths were rescaled "
-                f"by {momentum_scale:.6g}. Without it a downstream magnet is referenced "
-                "to the wrong rigidity."
+                f"{element_name}: an upstream cavity left ImpactX's reference momentum "
+                f"differing from Bmad's, so this element's normalised strengths were "
+                f"rescaled by {momentum_scale:.6g}. Without it the element would be "
+                "referenced to the wrong rigidity.\n"
+                "Across an rfcavity the two disagree by construction: Bmad holds p0c "
+                "fixed while ImpactX accelerates its reference. Inside an lcavity they "
+                "disagree only transiently -- a thin-kick model steps the reference "
+                "where Bmad ramps it -- and reconverge by the end of the structure."
             )
 
         for element in translated:
